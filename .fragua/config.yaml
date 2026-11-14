@@ -1,0 +1,13 @@
+# fragua project config — project-specific knobs only.
+# Generic preferences live in ~/.fragua/config.yaml.
+
+# Stable project identity. Committed so every clone shares it and runs
+# stay attributable across machines — do not change it.
+id: 01a1db7d-f453-76da-ad3f-c2311bf37560
+name: till
+
+# Uncomment if the project needs a per-worktree bootstrap command:
+# bootstrap: "bun install --frozen-lockfile"
+
+# Trust tier (fragua-city convention: owned | fork | stealth; kernel reads this).
+tier: owned
