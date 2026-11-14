@@ -1,0 +1,11 @@
+[package]
+name = "camofox-client"
+description = "Typed client for the Camofox browser REST API (port 9377)"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

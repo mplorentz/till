@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# till — the repo's own definition of "CI passes".
+# Same checks as .github/workflows/ci.yml; run before every PR.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace

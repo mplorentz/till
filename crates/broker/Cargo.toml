@@ -1,0 +1,11 @@
+[package]
+name = "broker"
+description = "till payment broker: HTTP API, state machine, storage, crypto"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

@@ -1,0 +1,21 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Environment / secrets — never commit
+.env
+.env.*
+*.pem
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Fragua runtime state
+.fragua/scratch/
+
+# Beads runtime (config.yaml + metadata.json are committed; DB is not)
+.beads/dolt/
+.beads/issues.jsonl
+.beads/.env

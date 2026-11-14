@@ -1,0 +1,11 @@
+[package]
+name = "mock-checkout"
+description = "Local 4-mode checkout test site + /stats submission counter"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

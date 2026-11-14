@@ -1,0 +1,11 @@
+[package]
+name = "discord-gw"
+description = "serenity bot: approval + result-review Discord interactions"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
