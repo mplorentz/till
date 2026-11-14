@@ -19,3 +19,20 @@
 .beads/dolt/
 .beads/issues.jsonl
 .beads/.env
+
+# fragua runtime — never commit these
+.fragua/runs/
+.fragua/worktrees/
+.fragua/blobs/
+.fragua/fragua.db*
+.fragua/daemon/
+
+# fragua — always commit these (negative patterns for clarity)
+!.fragua/config.yaml
+!.fragua/workflows/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/

@@ -1,0 +1,10 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_server_host": "dolt.lorentz.is",
+  "dolt_server_port": 3307,
+  "dolt_server_user": "hudson",
+  "dolt_database": "till",
+  "project_id": "43dd4eee-0e0e-4192-9908-a594afb52798"
+}
