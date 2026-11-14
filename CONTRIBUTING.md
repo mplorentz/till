@@ -5,6 +5,8 @@ details encrypted at rest, gets human approval over Discord, and fills the
 card fields into a Camofox browser tab — without card digits ever entering
 an agent's model context, the event bus, or any log.
 
+This repo is primarly written by AI, but all code is human-reviewed.
+
 **Read [`AGENTS.md`](AGENTS.md) before you write code.** It holds the
 non-negotiable security rules (card data never logged, filled only via
 `/tabs/:id/evaluate`, submit clicked exactly once, fields masked before any
