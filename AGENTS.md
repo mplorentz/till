@@ -25,6 +25,17 @@ These follow from the spec (§7, US-14) and override everything else:
    the broker (spec US-10).
 5. **No new dependencies without justification** — especially anything
    that touches card data, network egress, or the storage path.
+6. **Card data never leaves the broker.** The only permitted destination
+   of decrypted card values is the Camofox fill call for an approved
+   payment — never Discord, API responses, logs, the Hermes plugin, test
+   fixtures, or any other process or file. Ciphertext (age blob) is the
+   only persisted form.
+7. **No card data reaches Camofox without explicit owner approval.**
+   Card values are sent to Camofox only when the specific payment is in
+   the `approved` state, entered via the single human Approve click on
+   that payment — never before approval, never speculatively (no
+   pre-fill while waiting), and never for a post-`approval_timeout`
+   Approve.
 
 ## Repository layout
 

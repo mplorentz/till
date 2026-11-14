@@ -176,6 +176,15 @@ message. Late Approve clicks after `approval_timeout` are rejected and
 
 ## 7. Camofox Interaction Rules
 
+- **Card data never leaves the broker.** The sole permitted egress of
+  decrypted card values is the Camofox fill call for a specific
+  payment — never Discord, the Hermes plugin, API responses, or logs
+  (ciphertext at rest is the only persisted form).
+- **Card data reaches Camofox only after explicit owner approval.**
+  Card values are sent only when the specific payment has reached
+  `approved` via the human's single Approve click on that payment —
+  never before approval, never speculatively (no pre-fill while
+  waiting), and never on a late post-`approval_timeout` Approve.
 - **Field filling uses `evaluate`, not `/type`.** The current Camofox
   `/type` endpoint emits entered text onto the plugin event bus — card
   data must not pass through it.
