@@ -50,7 +50,7 @@ These follow from the spec (§7, US-14) and override everything else:
   `ambiguous`, `short_hold`) + `/stats` submission counter.
 - `plugin/` — the Hermes-side plugin (Python, `plugin.yaml` +
   `register(ctx)`), thin authenticated HTTP client for the broker API.
-- `docker/` — deployment on the Mac Mini.
+- `docker/` — deployment on the test host (host names are deliberately unspecified in this repo).
 
 Integration boundaries (Camofox, Discord) sit behind traits in the broker
 so the state machine is testable without either.

@@ -36,11 +36,11 @@ baseline.
 ## 2. Architecture
 
 ```
-Hermes agent (Jamie, test agent on the Mini)
+Hermes agent (Jamie, test agent on the test host)
    │  tools: request_payment / wait_for_payment / get_payment
    │  (thin authenticated HTTP client plugin — new, small)
    ▼
-Payment broker (Docker container on the Mac Mini)
+Payment broker (Docker container on the test host)
    │  • holds card data encrypted at rest
    │  • exposes HTTP API keyed per-agent
    │  • owns all payment state and policy
@@ -59,7 +59,7 @@ replaced.
 | D1 | Approval transport | Discord bot with signed button interactions |
 | D2 | Broker intelligence | LLM-free; agent supplies selectors, broker executes |
 | D3 | Human verification channel | Broker-captured screenshot of the checkout page, sent with the approval request |
-| D4 | Broker placement | Docker sidecar on the Mac Mini; per-agent API keys |
+| D4 | Broker placement | Docker sidecar on the test host; per-agent API keys. The eventual production deployment is on the client's own infrastructure; host details are deliberately unspecified in this repo |
 | D5 | Encryption at rest | Yes — defends against env-scraping / log disclosure, **not** against an attacker with container access |
 | D6 | Approval rounds | One. Single Approve authorizes fill + submit |
 | D7 | Outcome retrieval | **Polling** (`wait_for_payment`) — long-poll with bounded timeout. Broker-initiated outcome messages to the agent's thread are **deferred**. |
