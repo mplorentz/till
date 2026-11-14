@@ -1,6 +1,6 @@
 # Deployment (bead till-8)
 
-Docker packaging for the Mac Mini:
+Docker packaging for the test host (host names are deliberately unspecified in this repo):
 
 - multi-stage build of the broker (static-ish musl or glibc image),
 - compose stack: `broker` + `camofox` + `mock-checkout`,

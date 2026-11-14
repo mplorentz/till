@@ -31,7 +31,7 @@ Hermes agent ── request_payment / wait_for_payment / get_payment ──▶ t
 | `crates/discord-gw` | serenity bot: approval + result-review interactions |
 | `crates/mock-checkout` | local 4-mode test checkout site + `/stats` counter |
 | `plugin/` | Jamie-side Hermes plugin (Python) — thin HTTP client |
-| `docker/` | images + compose for the Mac Mini deployment |
+| `docker/` | images + compose for the test-host deployment |
 
 ## Development
 
