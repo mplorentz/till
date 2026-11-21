@@ -32,9 +32,17 @@ Constraints and measured facts:
 
 ## Decision
 
-`POST /payments/:id/wait` (and the plugin's `wait_for_payment`) is an
-**axum handler that subscribes to an in-process broadcast of state
-changes for that payment and awaits it with a bounded timeout**.
+> **Erratum (2026-11-22, bead till-1gt).** The endpoint is
+> `GET /payments/{id}/wait?timeout=` — the converged design for the broker
+> core chose `GET` (the wait has no body and no side effect), while this ADR
+> as originally written said `POST /payments/:id/wait`. Everything else below
+> is unchanged and is implemented as written. The plugin tool remains
+> `wait_for_payment(payment_id, timeout_seconds)`.
+
+`GET /payments/{id}/wait?timeout=` (and the plugin's
+`wait_for_payment`) is an **axum handler that subscribes to an in-process
+broadcast of state changes for that payment and awaits it with a bounded
+timeout**.
 
 * One `tokio::sync::watch::Sender<State>` per in-flight payment, held in
   a registry keyed by `payment_id`. Waiters clone the `Receiver`; the
