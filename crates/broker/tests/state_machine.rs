@@ -20,8 +20,8 @@ use axum::http::{Request, StatusCode};
 use broker::{
     ApiKeys, AppState, ApprovalRequest, BoxFuture, CamofoxPort, Cart, CartItem, DiscordPort,
     EngineConfig, EngineError, FieldKind, FieldSpec, FillRequest, NewPayment, OrderReference,
-    Outcome, PaymentEngine, PaymentId, PaymentState, PaymentView, PortError, ResultReviewRequest,
-    SqliteStore, StoreError, TransitionEffect,
+    Outcome, PaymentEngine, PaymentEvent, PaymentId, PaymentState, PaymentView, PortError,
+    ResultReviewRequest, SqliteStore, StoreError, TransitionEffect,
 };
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
@@ -281,27 +281,27 @@ async fn collect(response: axum::response::Response) -> TestResult<(StatusCode, 
 /// ports — the state a crash would leave behind (US-12).
 fn seed_submitting(store: &SqliteStore, request: &NewPayment) -> TestResult<PaymentId> {
     let payment_id = store.insert_pending(AGENT, request, i64::MAX)?;
-    for (from, to, effect) in [
+    for (from, event, effect) in [
         (
             PaymentState::PendingApproval,
-            PaymentState::Approved,
+            PaymentEvent::Approve,
             TransitionEffect::default(),
         ),
         (
             PaymentState::Approved,
-            PaymentState::Filling,
+            PaymentEvent::FillStarted,
             TransitionEffect::default(),
         ),
         (
             PaymentState::Filling,
-            PaymentState::Submitting,
+            PaymentEvent::SubmitAttempted,
             TransitionEffect {
                 submit_attempted: true,
                 ..TransitionEffect::default()
             },
         ),
     ] {
-        store.transition(payment_id, from, to, &effect)?;
+        store.transition(payment_id, from, event, &effect)?;
     }
     Ok(payment_id)
 }
@@ -501,6 +501,31 @@ async fn late_approve_after_timeout_is_rejected_nothing_filled() -> TestResult<(
     Ok(())
 }
 
+#[tokio::test]
+async fn late_decline_after_timeout_closes_as_approval_timeout() -> TestResult<()> {
+    let config = EngineConfig::new(Duration::from_secs(1), Duration::from_secs(120));
+    let harness = Harness::new("late-decline", Arc::new(Driver::default()), config)?;
+    let payment_id = harness.create(&request("late-decline-key")).await?;
+    harness
+        .await_state(payment_id, PaymentState::ApprovalTimeout)
+        .await?;
+
+    let decision = harness.engine.decline(payment_id)?;
+
+    assert_eq!(
+        decision,
+        broker::DecisionResult::Expired,
+        "both buttons are late after the hold"
+    );
+    assert_eq!(
+        harness.view(payment_id)?.state,
+        PaymentState::ApprovalTimeout,
+        "a late Decline must not rewrite the close reason"
+    );
+    assert_eq!(harness.driver.fills(), 0);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Pre-submit and post-submit failures
 // ---------------------------------------------------------------------------
@@ -579,13 +604,13 @@ async fn crash_recovery_aborts_presubmit_and_expires_stale_holds() -> TestResult
     store.transition(
         filling,
         PaymentState::PendingApproval,
-        PaymentState::Approved,
+        PaymentEvent::Approve,
         &TransitionEffect::default(),
     )?;
     store.transition(
         filling,
         PaymentState::Approved,
-        PaymentState::Filling,
+        PaymentEvent::FillStarted,
         &TransitionEffect::default(),
     )?;
     // `pending_approval` whose hold already expired while nobody was running.
@@ -857,7 +882,7 @@ async fn store_rejects_a_foreign_state_change() -> TestResult<()> {
     let result = harness.engine.store().transition(
         payment_id,
         PaymentState::PendingApproval,
-        PaymentState::Declined,
+        PaymentEvent::Decline,
         &TransitionEffect::default(),
     );
 
@@ -865,6 +890,52 @@ async fn store_rejects_a_foreign_state_change() -> TestResult<()> {
         matches!(result, Err(StoreError::Conflict { .. })),
         "a stale from-state cannot move the machine"
     );
+    Ok(())
+}
+
+/// The store is the single writer of `payments.state` and refuses any pair the
+/// spec §4 table does not list — `pending_approval → filling` would fill a card
+/// before approval (AGENTS.md rule 7), so it must be impossible to ask for.
+#[tokio::test]
+async fn store_refuses_a_transition_the_spec_does_not_list() -> TestResult<()> {
+    let harness = Harness::new(
+        "illegal",
+        Arc::new(Driver::default()),
+        EngineConfig::default(),
+    )?;
+    let payment_id = harness.create(&request("illegal-key")).await?;
+
+    // `FillStarted` is only legal from `approved`; from `pending_approval` it is
+    // the pre-approval fill that rule 7 forbids.
+    let illegal = harness.engine.store().transition(
+        payment_id,
+        PaymentState::PendingApproval,
+        PaymentEvent::FillStarted,
+        &TransitionEffect::default(),
+    );
+    // And a terminal payment accepts nothing at all.
+    harness.engine.decline(payment_id)?;
+    let after_terminal = harness.engine.store().transition(
+        payment_id,
+        PaymentState::Declined,
+        PaymentEvent::Approve,
+        &TransitionEffect::default(),
+    );
+
+    assert!(
+        matches!(illegal, Err(StoreError::Illegal(_))),
+        "the table, not the caller, decides what is legal"
+    );
+    assert!(
+        matches!(after_terminal, Err(StoreError::Illegal(_))),
+        "a terminal state accepts nothing (stale-click rejection)"
+    );
+    assert_eq!(
+        harness.view(payment_id)?.state,
+        PaymentState::Declined,
+        "a refused transition writes nothing"
+    );
+    assert_eq!(harness.driver.fills(), 0, "nothing could have been filled");
     Ok(())
 }
 

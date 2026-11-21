@@ -60,18 +60,6 @@ impl WaitRegistry {
         }
     }
 
-    /// How many live channels exist. Used by tests to assert clean-up.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.lock().len()
-    }
-
-    /// Whether the registry holds no channels.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
     fn lock(&self) -> MutexGuard<'_, HashMap<PaymentId, watch::Sender<PaymentState>>> {
         // A poisoned registry only means some other task panicked mid-update;
         // the map itself is still usable and dropping it would strand waiters.

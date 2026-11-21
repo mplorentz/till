@@ -27,7 +27,7 @@
 //! waiter never holds the write connection (ADR 0001, "Bad / accepted costs").
 //! No lock is held across an `await`; every helper returns owned values.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -134,6 +134,9 @@ pub enum StoreError {
         /// The state actually stored.
         current: PaymentState,
     },
+    /// The state machine refuses this (state, event) pair (spec §4).
+    #[error(transparent)]
+    Illegal(crate::state::IllegalTransition),
     /// The idempotency key is already used by this agent.
     #[error("duplicate idempotency key for payment {0}")]
     Duplicate(PaymentId),
@@ -153,7 +156,6 @@ pub enum StoreError {
 pub struct SqliteStore {
     writer: Mutex<Connection>,
     reader: Mutex<Connection>,
-    path: PathBuf,
 }
 
 impl SqliteStore {
@@ -182,14 +184,7 @@ impl SqliteStore {
         Ok(Self {
             writer: Mutex::new(writer),
             reader: Mutex::new(reader),
-            path,
         })
-    }
-
-    /// The database file this store owns.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 
     /// Claim the idempotency key and insert the payment as `pending_approval`.
@@ -304,7 +299,14 @@ impl SqliteStore {
     /// Apply one transition as a compare-and-set, appending history in the same
     /// commit.
     ///
-    /// The `WHERE state = expected` clause is what makes the state machine
+    /// This is the *only* writer of `payments.state`, and the target state is
+    /// not a parameter: it is computed by [`crate::state::transition`]. So the
+    /// spec §4 table is the single authority for legal moves — a caller cannot
+    /// hand in an arbitrary from→to pair, and an illegal pair (say
+    /// `pending_approval → filling`, which would fill a card before approval)
+    /// is refused as [`StoreError::Illegal`] before anything is written.
+    ///
+    /// The `WHERE state = expected` clause additionally makes the transition
     /// authoritative under concurrency: a hold-expiry timer racing an Approve
     /// click produces exactly one winner, and the loser gets
     /// [`StoreError::Conflict`].
@@ -312,9 +314,10 @@ impl SqliteStore {
         &self,
         payment_id: PaymentId,
         expected: PaymentState,
-        next: PaymentState,
+        event: crate::state::PaymentEvent,
         effect: &TransitionEffect,
     ) -> Result<StoredPayment, StoreError> {
+        let next = crate::state::transition(expected, event).map_err(StoreError::Illegal)?;
         let now = now_unix();
         let mut connection = self.writer.lock().map_err(|_| StoreError::Unavailable)?;
         let transaction = connection.transaction()?;

@@ -29,7 +29,7 @@ use tokio::time::{Instant, sleep_until, timeout_at};
 
 use crate::payment::{NewPayment, Outcome, PaymentId, PaymentView, TerminalReason};
 use crate::ports::{ApprovalRequest, CamofoxPort, DiscordPort, FillRequest, ResultReviewRequest};
-use crate::state::{PaymentEvent, PaymentState, transition};
+use crate::state::{PaymentEvent, PaymentState};
 use crate::store::{SqliteStore, StoreError, StoredPayment, TransitionEffect, now_unix};
 use crate::wait::WaitRegistry;
 
@@ -243,22 +243,14 @@ impl PaymentEngine {
         if stored.state != PaymentState::PendingApproval {
             return Ok(DecisionResult::Expired);
         }
-        if stored.approval_deadline <= now_unix() {
-            // The timer has not fired yet but the hold is over. Close it now so
-            // the click cannot authorize a fill (US-9).
-            self.finish(
-                payment_id,
-                PaymentState::PendingApproval,
-                PaymentState::ApprovalTimeout,
-                TerminalReason::HoldExpired,
-            );
+        if self.hold_over(&stored) {
             return Ok(DecisionResult::Expired);
         }
 
         let approved = match self.inner.store.transition(
             payment_id,
             PaymentState::PendingApproval,
-            PaymentState::Approved,
+            PaymentEvent::Approve,
             &TransitionEffect::default(),
         ) {
             Ok(stored) => stored,
@@ -284,11 +276,17 @@ impl PaymentEngine {
         if stored.state != PaymentState::PendingApproval {
             return Ok(DecisionResult::Expired);
         }
+        // A click after the hold elapsed is late whichever button it is: the
+        // payment is closed as `approval_timeout`, not `declined`, so both
+        // buttons behave identically (US-9).
+        if self.hold_over(&stored) {
+            return Ok(DecisionResult::Expired);
+        }
 
         let applied = self.try_finish(
             payment_id,
             PaymentState::PendingApproval,
-            PaymentState::Declined,
+            PaymentEvent::Decline,
             TerminalReason::DeclinedByHuman,
         )?;
         Ok(if applied {
@@ -308,15 +306,7 @@ impl PaymentEngine {
         payment_id: PaymentId,
         outcome: Outcome,
     ) -> Result<DecisionResult, EngineError> {
-        let kind = outcome.kind();
-        let next = transition(
-            PaymentState::AwaitingResultReview,
-            PaymentEvent::Outcome(kind),
-        );
-        let Ok(next) = next else {
-            return Ok(DecisionResult::Expired);
-        };
-
+        let event = PaymentEvent::Outcome(outcome.kind());
         let stored = self.inner.store.load(payment_id)?;
         if stored.state != PaymentState::AwaitingResultReview {
             // A stale interaction on a terminal payment gets "this request has
@@ -332,14 +322,16 @@ impl PaymentEngine {
         match self.inner.store.transition(
             payment_id,
             PaymentState::AwaitingResultReview,
-            next,
+            event,
             &effect,
         ) {
             Ok(stored) => {
                 self.inner.waiters.publish(payment_id, stored.state);
                 Ok(DecisionResult::Applied)
             }
-            Err(StoreError::Conflict { .. }) => Ok(DecisionResult::Expired),
+            Err(StoreError::Conflict { .. } | StoreError::Illegal(_)) => {
+                Ok(DecisionResult::Expired)
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -473,28 +465,22 @@ impl PaymentEngine {
                         self.finish(
                             payment_id,
                             PaymentState::PendingApproval,
-                            PaymentState::ApprovalTimeout,
+                            PaymentEvent::HoldExpired,
                             TerminalReason::HoldExpired,
                         );
                     }
                 }
                 PaymentState::AwaitingResultReview => {}
                 PaymentState::Approved | PaymentState::Filling | PaymentState::Submitting => {
-                    if stored.submit_attempted {
-                        self.finish(
-                            payment_id,
-                            stored.state,
-                            PaymentState::Ambiguous,
-                            TerminalReason::CrashRecovery,
-                        );
-                    } else {
-                        self.finish(
-                            payment_id,
-                            stored.state,
-                            PaymentState::AbortedBeforeSubmit,
-                            TerminalReason::CrashRecovery,
-                        );
-                    }
+                    // One event: the table decides whether this is
+                    // `ambiguous` (latched, cannot prove the click) or
+                    // `aborted_before_submit` (nothing was ever sent).
+                    self.finish(
+                        payment_id,
+                        stored.state,
+                        PaymentEvent::CrashRecovered,
+                        TerminalReason::CrashRecovery,
+                    );
                 }
                 // Terminal states are not in flight; nothing to do.
                 _ => {}
@@ -521,7 +507,7 @@ impl PaymentEngine {
         self.finish(
             payment_id,
             PaymentState::PendingApproval,
-            PaymentState::ApprovalTimeout,
+            PaymentEvent::HoldExpired,
             TerminalReason::HoldExpired,
         );
     }
@@ -543,7 +529,7 @@ impl PaymentEngine {
         if !self.advance(
             payment_id,
             PaymentState::Approved,
-            PaymentState::Filling,
+            PaymentEvent::FillStarted,
             TransitionEffect::default(),
         ) {
             return;
@@ -564,7 +550,7 @@ impl PaymentEngine {
             self.finish(
                 payment_id,
                 PaymentState::Filling,
-                PaymentState::AbortedBeforeSubmit,
+                PaymentEvent::FillFailed,
                 TerminalReason::PreSubmitError,
             );
             return;
@@ -575,7 +561,7 @@ impl PaymentEngine {
         if !self.advance(
             payment_id,
             PaymentState::Filling,
-            PaymentState::Submitting,
+            PaymentEvent::SubmitAttempted,
             TransitionEffect {
                 submit_attempted: true,
                 ..TransitionEffect::default()
@@ -595,7 +581,7 @@ impl PaymentEngine {
             self.finish(
                 payment_id,
                 PaymentState::Submitting,
-                PaymentState::Ambiguous,
+                PaymentEvent::ClickUnconfirmed,
                 TerminalReason::UnconfirmedSubmit,
             );
             return;
@@ -604,7 +590,7 @@ impl PaymentEngine {
         if !self.advance(
             payment_id,
             PaymentState::Submitting,
-            PaymentState::AwaitingResultReview,
+            PaymentEvent::SubmitCompleted,
             TransitionEffect::default(),
         ) {
             return;
@@ -630,19 +616,26 @@ impl PaymentEngine {
         &self,
         payment_id: PaymentId,
         from: PaymentState,
-        to: PaymentState,
+        event: PaymentEvent,
         effect: TransitionEffect,
     ) -> bool {
-        match self.inner.store.transition(payment_id, from, to, &effect) {
+        match self
+            .inner
+            .store
+            .transition(payment_id, from, event, &effect)
+        {
             Ok(stored) => {
                 self.inner.waiters.publish(payment_id, stored.state);
                 true
             }
             Err(error) => {
                 // Conflicts mean the state machine already moved on (another
-                // click, the hold timer, a restart): safe to ignore.
+                // click, the hold timer, a restart): safe to ignore. An
+                // `Illegal` here would be a broker bug in the calling path.
                 if !matches!(error, StoreError::Conflict { .. }) {
-                    eprintln!("broker: transition {payment_id} {from:?}->{to:?} failed: {error}");
+                    eprintln!(
+                        "broker: transition {payment_id} {from:?} on {event:?} failed: {error}"
+                    );
                 }
                 false
             }
@@ -654,13 +647,13 @@ impl PaymentEngine {
         &self,
         payment_id: PaymentId,
         from: PaymentState,
-        to: PaymentState,
+        event: PaymentEvent,
         reason: TerminalReason,
     ) -> bool {
         self.advance(
             payment_id,
             from,
-            to,
+            event,
             TransitionEffect {
                 terminal_reason: Some(reason),
                 ..TransitionEffect::default()
@@ -673,13 +666,13 @@ impl PaymentEngine {
         &self,
         payment_id: PaymentId,
         from: PaymentState,
-        to: PaymentState,
+        event: PaymentEvent,
         reason: TerminalReason,
     ) -> Result<bool, EngineError> {
         match self.inner.store.transition(
             payment_id,
             from,
-            to,
+            event,
             &TransitionEffect {
                 terminal_reason: Some(reason),
                 ..TransitionEffect::default()
@@ -692,6 +685,24 @@ impl PaymentEngine {
             Err(StoreError::Conflict { .. }) => Ok(false),
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// Whether the human's window has closed, closing the payment if so.
+    ///
+    /// Both clicks share this: a late click of either kind is refused, and the
+    /// payment is recorded as `approval_timeout` rather than left pending until
+    /// the timer task gets around to it (US-9). Nothing is filled.
+    fn hold_over(&self, stored: &StoredPayment) -> bool {
+        if stored.approval_deadline > now_unix() {
+            return false;
+        }
+        self.finish(
+            stored.payment_id,
+            PaymentState::PendingApproval,
+            PaymentEvent::HoldExpired,
+            TerminalReason::HoldExpired,
+        );
+        true
     }
 }
 

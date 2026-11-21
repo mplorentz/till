@@ -130,8 +130,6 @@ pub enum PaymentEvent {
     HoldExpired,
     /// The broker is about to start filling (post-approval only).
     FillStarted,
-    /// Every field was typed successfully.
-    FieldsFilled,
     /// A pre-submit Camofox/tab error; nothing was submitted.
     FillFailed,
     /// The submit-once latch is committed; the click is in flight.
@@ -179,7 +177,8 @@ pub fn transition(
         (S::Approved, E::FillStarted) => S::Filling,
         // A fill error before any submit: nothing was typed or clicked.
         (S::Approved | S::Filling, E::FillFailed) => S::AbortedBeforeSubmit,
-        (S::Filling, E::FieldsFilled) => S::Submitting,
+        // One event for `filling → submitting`: the latch commit. It is the
+        // only way in, so "filled but not latched" is not a representable state.
         (S::Filling, E::SubmitAttempted) => S::Submitting,
 
         (S::Submitting, E::SubmitCompleted) => S::AwaitingResultReview,
@@ -223,12 +222,11 @@ mod tests {
         PaymentState::AbortedBeforeSubmit,
     ];
 
-    const ALL_EVENTS: [PaymentEvent; 12] = [
+    const ALL_EVENTS: [PaymentEvent; 11] = [
         PaymentEvent::Approve,
         PaymentEvent::Decline,
         PaymentEvent::HoldExpired,
         PaymentEvent::FillStarted,
-        PaymentEvent::FieldsFilled,
         PaymentEvent::FillFailed,
         PaymentEvent::SubmitAttempted,
         PaymentEvent::SubmitCompleted,
@@ -250,7 +248,6 @@ mod tests {
             ((S::PendingApproval, E::HoldExpired), S::ApprovalTimeout),
             ((S::Approved, E::FillStarted), S::Filling),
             ((S::Approved, E::FillFailed), S::AbortedBeforeSubmit),
-            ((S::Filling, E::FieldsFilled), S::Submitting),
             ((S::Filling, E::SubmitAttempted), S::Submitting),
             ((S::Filling, E::FillFailed), S::AbortedBeforeSubmit),
             ((S::Submitting, E::SubmitCompleted), S::AwaitingResultReview),

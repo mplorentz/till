@@ -46,6 +46,12 @@ database file on a mounted volume.
   `fields_json` (selectors + `field_kind` **only — never values**),
   `submit_selector`, `created_at`, `updated_at`, `approval_deadline`,
   `terminal_reason`.
+  *Schema note (2026-11-22, bead till-1gt):* the `session_key` column is
+  deferred to the Camofox wiring bead (till-5), together with the
+  `card_blobs` table from ADR 0002. The broker core neither binds a Camofox
+  session nor stores a card value, so neither column would be read or
+  written there; adding them now would be dead schema. `tab_id` is stored
+  from the start because the fill path needs it.
 * One `transitions` append-only table: `(payment_id, from_state,
   to_state, at, reason)` — the state machine is the product, so its
   history is queryable.

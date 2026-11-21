@@ -39,9 +39,10 @@ Constraints and measured facts:
 > is unchanged and is implemented as written. The plugin tool remains
 > `wait_for_payment(payment_id, timeout_seconds)`.
 
-`POST /payments/:id/wait` (and the plugin's `wait_for_payment`) is an
-**axum handler that subscribes to an in-process broadcast of state
-changes for that payment and awaits it with a bounded timeout**.
+`GET /payments/{id}/wait?timeout=` (and the plugin's
+`wait_for_payment`) is an **axum handler that subscribes to an in-process
+broadcast of state changes for that payment and awaits it with a bounded
+timeout**.
 
 * One `tokio::sync::watch::Sender<State>` per in-flight payment, held in
   a registry keyed by `payment_id`. Waiters clone the `Receiver`; the
