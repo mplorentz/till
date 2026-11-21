@@ -24,10 +24,18 @@ Camofox instance:
 3. Playwright tracing writes fill values to disk in plaintext (spike
    finding A).
 
-Together: the event bus hands the agent card values *passively* — but
-only inside a window in which the same agent can already read them
-*actively* from the DOM. The bus grants **no new capability**; it changes
-passive capture from impossible to possible within that window.
+Together: the event bus hands card values *passively* to anything
+subscribed — but with the precision the spike added: `pluginEvents` is an
+in-process Node `EventEmitter` inside the camofox container. **An
+HTTP-only agent (Jamie) cannot subscribe to the bus at all** — the
+spec's original “/type emits entered text … the agent can see it” was
+too strong. The bus exposure is a *plugin supply-chain* channel (any
+plugin loaded inside the container — including ones added later — is
+handed card digits as a plain object; none subscribe today). The
+**agent-side** residual is the DOM readback via the shared `userId`,
+which is real, measured, and unaffected by any event redaction. This
+is why the session lock (Decision 5) is the actual control and event
+redaction is defense-in-depth.
 
 ## Prior art
 
@@ -74,24 +82,40 @@ passive capture from impossible to possible within that window.
    boundary is the broker's own egress plus the moment of fill; what is
    in the page after fill belongs to the page (the 1Password boundary).
    Residual exposure: one transient plugin event, inside a window where
-   the subscriber already has direct DOM access.
-2. **Mandatory mitigations** (enforced by the fill engine, bead till-ipx):
-   - exactly **one** `evaluate` call per fill — all fields in a single
-     expression, so exactly one bus event per payment;
-   - the expression returns `undefined` — nothing in the result event;
+   the agent already has direct DOM access.
+2. **Mandatory mitigations** (enforced by the fill engine, bead till-ipx
+   — binding regardless of which fill primitive is chosen):
+   - exactly **one** fill operation per payment (one `evaluate` call, or
+     one `/type` batch) — exactly one bus event;
+   - nothing sensitive reaches any result/return channel;
    - Playwright **tracing off** for payment tabs (spike finding A);
    - `about:blank` containment via `evaluate` after terminal outcome
      (spec §7; `/navigate` is rejected for it — spike finding B).
-3. **Hardening deliverable, gated before real-merchant testing**: an
-   upstream PR to jo-inc/camofox-browser mirroring #9436 for the
-   `tab:evaluate`/`tab:evaluated` pair (emit `expressionLength` plus a
-   correlation hash; result payload carries only its type). Tracked as
-   its own bead; part of the client conversation.
-4. **Client deployment recommendation** (independent of this broker):
-   upgrade the production camofox to ≥ v1.16.0 (gets #9436's `/type`
-   redaction and the #3087 access-key middleware) and set
-   `CAMOFOX_ACCESS_KEY`. The measurement host for this project runs
-   v1.13.0, which predates both.
+3. **Fill primitive**: on camofox ≥ v1.16, `/type`'s bus payload is
+   length-only (upstream #9436), making it bus-clean **today** without
+   waiting for any patch — and its real keystrokes give higher input
+   fidelity than a programmatic value set. `evaluate` remains necessary
+   for `about:blank` containment and as a fallback for fields where
+   typing misbehaves. Either primitive is acceptable under this
+   boundary; the choice is made at till-ipx implementation against the
+   upgraded host.
+4. **Tier 1 — stopgap hardening** (before real-merchant testing, tracked
+   as bead till-aal): deploy camofox ≥ v1.16 on every host the broker
+   runs against and set `CAMOFOX_ACCESS_KEY` (gets #9436's `/type`
+   redaction and #3087's access-key middleware); file an upstream PR to
+   jo-inc/camofox-browser mirroring #9436 for the `tab:evaluate`/
+   `tab:evaluated` pair (`expressionLength` + correlation hash; result
+   payload = type only).
+5. **Tier 2 — the real control**: broker-exclusive session access in
+   camofox — per-principal auth (the broker gets its own credential,
+   not a shared string `userId`) plus a **tab lease/transfer API**: the
+   agent hands the tab to the broker for the fill window, agent calls
+   are refused during the lease, the broker releases to `about:blank`.
+   This structurally kills the DOM-readback residual (which no event
+   redaction touches) and the bus exposure together. It is the spec's
+   deferred non-goal made concrete, it is upstream work in the client's
+   infra, and it is the position to propose in the client conversation:
+   event redaction is the days-scale stopgap; the lease is the fix.
 
 ## Consequences
 

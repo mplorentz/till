@@ -213,8 +213,9 @@ These are explicit baseline assumptions, not hard security guarantees:
    carries no authentication, so the broker must share the agent's
    `userId` — the agent retains DOM access to the tab throughout the
    window. `evaluate` additionally publishes the expression (which
-   inlines card values) and the result on the plugin event bus.
-   **Boundary (ADR 0005):** the broker's responsibility ends at its own
+   inlines card values) and the result on the plugin event bus
+   (in-container plugin subscribers only — an HTTP-only agent cannot
+   subscribe; spike Q1). **Boundary (ADR 0005):** the broker's responsibility ends at its own
    egress and the fill action; values in the page belong to the page —
    the same boundary password managers draw at autofill. Baseline
    mitigations, mandatory for the fill engine: exactly ONE `evaluate`
