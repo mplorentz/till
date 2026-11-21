@@ -207,12 +207,26 @@ These are explicit baseline assumptions, not hard security guarantees:
    verification, but initially it does not independently prove the
    agent-reported total matches the checkout page. The screenshot is
    the human's check.
-2. **Agent does not read card values from the DOM during the
-   fill→submit window.** The skill instructs the agent not to; the broker
-   navigates to `about:blank` afterward to bound the window. Future
-   hardening: broker-exclusive tab lock in Camofox (requires
-   per-principal auth Camofox does not currently have — see 2026-10-26
-   analysis).
+2. **Agent does not read card values from the DOM or the plugin event
+   bus during the fill→submit window.** Measured by the spike (PR #3):
+   tabs are strictly `userId`-scoped with no transfer API and `userId`
+   carries no authentication, so the broker must share the agent's
+   `userId` — the agent retains DOM access to the tab throughout the
+   window. `evaluate` additionally publishes the expression (which
+   inlines card values) and the result on the plugin event bus.
+   **Boundary (ADR 0005):** the broker's responsibility ends at its own
+   egress and the fill action; values in the page belong to the page —
+   the same boundary password managers draw at autofill. Baseline
+   mitigations, mandatory for the fill engine: exactly ONE `evaluate`
+   call per fill (one bus event), result returns `undefined`, tracing
+   off for payment tabs. Residual: one transient bus event inside a
+   window in which the agent already has direct DOM access — no new
+   capability. Hardening: the `tab:evaluate`/`tab:evaluated` pair is
+   unredacted upstream ([jo-inc/camofox-browser#9436](https://github.com/jo-inc/camofox-browser/pull/9436)
+   fixed only `/type`); the upstream redaction patch is a deliverable
+   gated before real-merchant testing, and broker-exclusive tab locking
+   would additionally require per-principal auth Camofox does not
+   currently have.
 
 ## 9. Mock Checkout Site
 
