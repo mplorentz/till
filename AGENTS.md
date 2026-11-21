@@ -16,12 +16,13 @@ These follow from the spec (§7, US-14) and override everything else:
    messages. Use the `secrecy`/`zeroize` wrappers; if a value is a card
    field, treat it as radioactive.
 2. **Fill via `POST /tabs/:id/type`, never an `evaluate` that carries
-   card digits** (revised 2026-11-21, ADR 0005). On camofox ≥ v1.16,
-   `/type`'s plugin-bus payload is length-only (upstream #9436) —
-   bus-clean in a released version, no dependence on unmerged upstream
-   work. The broker refuses to fill on older hosts. `evaluate` is
-   allowed ONLY for digit-free operations: `about:blank` containment
-   and clearing/masking fields before screenshots. This is spec §7.
+   card digits** (revised 2026-11-21, ADR 0005). On camofox ≥ v1.16
+   (assumed — documented prerequisite, not runtime-checked), `/type`'s
+   plugin-bus payload is length-only (upstream #9436) — bus-clean in a
+   released version, no dependence on unmerged upstream work.
+   `evaluate` is allowed ONLY for digit-free operations: `about:blank`
+   containment and clearing/masking fields before screenshots. This is
+   spec §7.
 3. **Click submit exactly once per payment.** The submit-once latch is
    persisted *before* the click; if the broker loses contact with Camofox
    around the click, the payment goes `ambiguous`, never "try again".

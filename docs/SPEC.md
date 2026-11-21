@@ -189,8 +189,9 @@ message. Late Approve clicks after `approval_timeout` are rejected and
   ADR 0005). On camofox ≥ v1.16, `/type`'s plugin-bus payload is
   length-only (upstream #9436) — bus-clean in a **released** version,
   with no dependence on unmerged upstream work, and real keystrokes give
-  higher input fidelity than a programmatic value set. The broker
-  refuses to fill on hosts older than v1.16. `evaluate` is reserved for
+  higher input fidelity than a programmatic value set. Camofox ≥ v1.16
+  is a documented prerequisite, assumed rather than runtime-enforced.
+  `evaluate` is reserved for
   the operations that carry **no card digits**: `about:blank`
   containment and clearing/masking fields before the result screenshot
   (`/navigate` rejects `about:blank`; those expressions contain field

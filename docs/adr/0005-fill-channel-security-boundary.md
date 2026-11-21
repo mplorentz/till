@@ -103,11 +103,11 @@ redaction is defense-in-depth.
    result screenshot — those expressions contain field *references*,
    never values, so they are safe on any version. Falling back to
    `evaluate` for a fill is disallowed unless the Tier-1 redaction has
-   landed on that host; on pre-1.16 hosts the broker must refuse to
-   fill at all (both primitives emit raw content there).
-   **Version gate**: the broker is configured with the host's camofox
-   version and refuses to fill unless it can assert ≥ 1.16; the
-   deployment (bead till-u8p) asserts the actual image tag end-to-end.
+   landed on that host; pre-1.16 hosts (where both primitives emit raw
+   content) are out of scope entirely.
+   **Prerequisite, not a runtime gate** (2026-11-21 overseer decision):
+   camofox ≥ v1.16 is *assumed* — modern hosts only. Documented in the
+   spec and deployment notes, not enforced by the broker at runtime.
 4. **Tier 1 — stopgap hardening** (before real-merchant testing, tracked
    as bead till-aal): deploy camofox ≥ v1.16 on every host the broker
    runs against and set `CAMOFOX_ACCESS_KEY` (gets #9436's `/type`
