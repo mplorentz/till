@@ -9,3 +9,23 @@ version.workspace = true
 workspace = true
 
 [dependencies]
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+# Storage: SQLite per ADR 0001 (WAL, inspectable with `sqlite3`). `bundled`
+# keeps the container free of a system libsqlite dependency, which is why
+# ADR 0001 already justifies this dependency; see AGENTS.md rule 5.
+rusqlite = { version = "0.37", features = ["bundled"] }
+# Payment identifiers. A random v4 UUID is the least surprising way to mint
+# an unguessable id that is safe to hand to an agent in an API response.
+uuid = { version = "1", features = ["serde", "v4"] }
+# Error enums for store/engine/auth. Hand-written `Display` for four enums is
+# noise, and these types never carry card data (AGENTS.md rule 1).
+thiserror = "2"
+
+[dev-dependencies]
+# Test-only: drives the router in-process via `tower::ServiceExt::oneshot`
+# instead of spawning a server and pulling in an HTTP client. `tower` is
+# already in the dependency tree through axum; see AGENTS.md rule 5.
+tower = { version = "0.5", features = ["util"] }
