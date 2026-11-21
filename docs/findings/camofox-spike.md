@@ -596,3 +596,28 @@ OpenClaw-format aliases, and `GET /tabs/{id}/stats` exposes
 * **Long-run memory pressure / eviction** (Fly-only paths here) and
   `/pressure/cleanup` semantics — not exercised.
 * **The 4-mode mock checkout itself**: till-2, not this spike.
+---
+
+## Upstream references (2026-11-21 addendum)
+
+Where each finding stands upstream (jo-inc/camofox-browser), and the prior
+art that informed ADR 0005:
+
+- **#9436 — "stop broadcasting typed text to plugins"** (merged into
+  v1.16.0): the `/type` half of Q1. Emits `textLength` instead of `text` —
+  the same redaction ADR 0005 proposes for the `evaluate` pair. The
+  instance measured for this spike (v1.13.0) predates it.
+  <https://github.com/jo-inc/camofox-browser/pull/9436>
+- **#3087 — evaluate endpoint required no API key** (CWE-94, High): since
+  resolved by a global access-key middleware (`CAMOFOX_ACCESS_KEY`). Also
+  postdates the measured v1.13.0. <https://github.com/jo-inc/camofox-browser/pull/3087>
+- **The `tab:evaluate`/`tab:evaluated` pair remains unredacted on current
+  main** (Q2 above) — no upstream issue exists yet; ADR 0005 tracks it as
+  a deliverable.
+- Prior art for the boundary decision: browser-use's leak-and-patch arc
+  ([#2226](https://github.com/browser-use/browser-use/issues/2226),
+  [#4388](https://github.com/browser-use/browser-use/pull/4388),
+  [#6455](https://github.com/browser-use/browser-use/pull/6455)),
+  1Password's stated autofill boundary, and
+  [playwright#19992](https://github.com/microsoft/playwright/issues/19992)
+  (redaction must happen at emit, not after).

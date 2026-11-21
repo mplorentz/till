@@ -185,9 +185,18 @@ message. Late Approve clicks after `approval_timeout` are rejected and
   `approved` via the human's single Approve click on that payment —
   never before approval, never speculatively (no pre-fill while
   waiting), and never on a late post-`approval_timeout` Approve.
-- **Field filling uses `evaluate`, not `/type`.** The current Camofox
-  `/type` endpoint emits entered text onto the plugin event bus — card
-  data must not pass through it.
+- **Field filling uses `/type`, never `evaluate`** (revised 2026-11-21,
+  ADR 0005). On camofox ≥ v1.16, `/type`'s plugin-bus payload is
+  length-only (upstream #9436) — bus-clean in a **released** version,
+  with no dependence on unmerged upstream work, and real keystrokes give
+  higher input fidelity than a programmatic value set. Camofox ≥ v1.16
+  is a documented prerequisite, assumed rather than runtime-enforced.
+  `evaluate` is reserved for
+  the operations that carry **no card digits**: `about:blank`
+  containment and clearing/masking fields before the result screenshot
+  (`/navigate` rejects `about:blank`; those expressions contain field
+  references only). Falling back to an `evaluate` fill is prohibited
+  unless the evaluate-pair redaction has landed on that host.
 - The submit click is executed **exactly once** per payment. If the
   broker loses its connection to Camofox after clicking but before
   observing the outcome, the payment transitions to `ambiguous`.
@@ -207,12 +216,29 @@ These are explicit baseline assumptions, not hard security guarantees:
    verification, but initially it does not independently prove the
    agent-reported total matches the checkout page. The screenshot is
    the human's check.
-2. **Agent does not read card values from the DOM during the
-   fill→submit window.** The skill instructs the agent not to; the broker
-   navigates to `about:blank` afterward to bound the window. Future
-   hardening: broker-exclusive tab lock in Camofox (requires
-   per-principal auth Camofox does not currently have — see 2026-10-26
-   analysis).
+2. **Agent does not read card values from the DOM or the plugin event
+   bus during the fill→submit window.** Measured by the spike (PR #3):
+   tabs are strictly `userId`-scoped with no transfer API and `userId`
+   carries no authentication, so the broker must share the agent's
+   `userId` — the agent retains DOM access to the tab throughout the
+   window. `evaluate` additionally publishes the expression (which
+   inlines card values) and the result on the plugin event bus
+   (in-container plugin subscribers only — an HTTP-only agent cannot
+   subscribe; spike Q1). **Boundary (ADR 0005):** the broker's responsibility ends at its own
+   egress and the fill action; values in the page belong to the page —
+   the same boundary password managers draw at autofill. Baseline
+   mitigations, mandatory for the fill engine: fill via `/type` only on
+   camofox ≥ v1.16 (bus payload is length-only — upstream #9436), so the
+   bus carries field *lengths*, never values; `evaluate` only for
+   digit-free operations; tracing off for payment tabs. Residual: the
+   agent's DOM access during the fill→submit window — bounded by
+   `about:blank` after the terminal outcome, and structurally fixed only
+   by session locking (ADR 0005 Tier 2: per-principal auth + tab
+   leasing — upstream work in the client's infra). The
+   `tab:evaluate`/`tab:evaluated` pair remains unredacted upstream
+   ([jo-inc/camofox-browser#9436](https://github.com/jo-inc/camofox-browser/pull/9436)
+   fixed only `/type`); a redaction PR for it is Tier-1 defense-in-depth
+   and no longer a dependency of this design.
 
 ## 9. Mock Checkout Site
 
