@@ -91,14 +91,23 @@ redaction is defense-in-depth.
    - Playwright **tracing off** for payment tabs (spike finding A);
    - `about:blank` containment via `evaluate` after terminal outcome
      (spec §7; `/navigate` is rejected for it — spike finding B).
-3. **Fill primitive**: on camofox ≥ v1.16, `/type`'s bus payload is
-   length-only (upstream #9436), making it bus-clean **today** without
-   waiting for any patch — and its real keystrokes give higher input
-   fidelity than a programmatic value set. `evaluate` remains necessary
-   for `about:blank` containment and as a fallback for fields where
-   typing misbehaves. Either primitive is acceptable under this
-   boundary; the choice is made at till-ipx implementation against the
-   upgraded host.
+3. **Fill primitive — `/type` on camofox ≥ v1.16, primary** (revised
+   2026-11-21 per overseer: the initial implementation must not depend
+   on any unmerged upstream PR). `#9436`'s redaction (`textLength`
+   only on the `tab:type` bus payload) **ships in released v1.16.0** —
+   choosing `/type` means the broker is bus-clean today with zero
+   upstream dependencies, and its real keystrokes give higher input
+   fidelity than a programmatic value set. `evaluate` is **demoted to
+   the no-card-digit uses only**: `about:blank` containment (finding B:
+   `/navigate` rejects it) and clearing/masking fields before the
+   result screenshot — those expressions contain field *references*,
+   never values, so they are safe on any version. Falling back to
+   `evaluate` for a fill is disallowed unless the Tier-1 redaction has
+   landed on that host; on pre-1.16 hosts the broker must refuse to
+   fill at all (both primitives emit raw content there).
+   **Version gate**: the broker is configured with the host's camofox
+   version and refuses to fill unless it can assert ≥ 1.16; the
+   deployment (bead till-u8p) asserts the actual image tag end-to-end.
 4. **Tier 1 — stopgap hardening** (before real-merchant testing, tracked
    as bead till-aal): deploy camofox ≥ v1.16 on every host the broker
    runs against and set `CAMOFOX_ACCESS_KEY` (gets #9436's `/type`
