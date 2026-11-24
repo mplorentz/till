@@ -217,14 +217,19 @@ fn remove(arguments: &[String]) -> Result<(), &'static str> {
     let database = database_path(&options);
 
     let store = SqliteStore::open(&database).map_err(|_| "the database could not be opened")?;
-    let removed = store
-        .remove_card(card_id)
-        .map_err(|_| "the card could not be removed")?;
-    if removed {
-        println!("removed card {card_id}");
+    let retired = store.retire_card(card_id).map_err(|error| match error {
+        broker::StoreError::CardInUse(_) => {
+            "that card is in use by a payment that has not settled yet"
+        }
+        _ => "the card could not be retired",
+    })?;
+    if retired {
+        // Retirement keeps the row so payments keep their history; the card
+        // simply stops being offered.
+        println!("retired card {card_id}");
         Ok(())
     } else {
-        Err("no such card")
+        Err("no such card, or it is already retired")
     }
 }
 

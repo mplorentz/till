@@ -22,7 +22,9 @@
 //!   and last four in clear (PCI-permissible display data), and the full card
 //!   as an `age` ciphertext blob. No column here holds a PAN, expiry or CVV.
 //!   The blob is written by the registration CLI and decrypted only by the
-//!   engine's approved fill path (`crate::crypto`).
+//!   engine's approved fill path (`crate::crypto`). Cards are **retired**, not
+//!   deleted (`retired_at`): a payment's `chosen_card` keeps pointing at the
+//!   card it paid with, and a retired card vanishes from the approval listing.
 //!
 //! Concurrency: one write connection behind a mutex (writes are serialized,
 //! transitions are short) and a second connection for reads, so a long-poll
@@ -43,7 +45,7 @@ use crate::payment::{
 use crate::state::PaymentState;
 
 /// Current schema version (`PRAGMA user_version`).
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Longest accepted pet name.
 pub const MAX_PET_NAME_LEN: usize = 48;
@@ -151,9 +153,9 @@ pub enum StoreError {
     /// The idempotency key is already used by this agent.
     #[error("duplicate idempotency key for payment {0}")]
     Duplicate(PaymentId),
-    /// No such card.
-    #[error("no such card: {0}")]
-    CardNotFound(CardId),
+    /// The card is the chosen card of a payment that has not settled yet.
+    #[error("card {0} is in use by a live payment")]
+    CardInUse(CardId),
     /// A card with this pet name already exists.
     #[error("a card named {0:?} already exists")]
     DuplicateCardName(String),
@@ -484,13 +486,18 @@ impl SqliteStore {
     /// The card-listing surface the approval flow renders: id, pet name,
     /// last four. Never a card value (ADR 0007, spec §6).
     ///
+    /// Retired cards are not listed: they are kept only so the payments that
+    /// used them keep their `chosen_card` reference.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Sqlite`], [`StoreError::Unavailable`].
     pub fn cards(&self) -> Result<Vec<CardSummary>, StoreError> {
         let connection = self.reader.lock().map_err(|_| StoreError::Unavailable)?;
         let mut statement = connection.prepare(
-            "SELECT card_id, pet_name, last4 FROM cards ORDER BY pet_name ASC, created_at ASC",
+            "SELECT card_id, pet_name, last4 FROM cards
+             WHERE retired_at IS NULL
+             ORDER BY pet_name ASC, created_at ASC",
         )?;
         let rows = statement.query_map([], |row| {
             let card_id: String = row.get(0)?;
@@ -518,7 +525,9 @@ impl SqliteStore {
     ///
     /// Ciphertext only: reading it is harmless by construction, decrypting it
     /// is [`crate::crypto::CardCipher::decrypt`]'s job inside the approved
-    /// fill path.
+    /// fill path. This deliberately does **not** filter retired cards: a
+    /// payment that was approved with a card must still be able to finish
+    /// filling with it.
     ///
     /// # Errors
     ///
@@ -535,18 +544,87 @@ impl SqliteStore {
         Ok(blob)
     }
 
-    /// Forget one card. Returns whether a row was removed.
+    /// One **active** card's summary, or `None` when it does not exist or has
+    /// been retired.
+    ///
+    /// The approval flow must not offer a retired card, so this is what a
+    /// click's explicit choice is resolved against (ADR 0007).
     ///
     /// # Errors
     ///
     /// [`StoreError::Sqlite`], [`StoreError::Unavailable`].
-    pub fn remove_card(&self, card_id: CardId) -> Result<bool, StoreError> {
-        let connection = self.writer.lock().map_err(|_| StoreError::Unavailable)?;
-        let removed = connection.execute(
-            "DELETE FROM cards WHERE card_id = ?1",
-            params![card_id.to_string()],
+    pub fn active_card(&self, card_id: CardId) -> Result<Option<CardSummary>, StoreError> {
+        let connection = self.reader.lock().map_err(|_| StoreError::Unavailable)?;
+        let row = connection
+            .query_row(
+                "SELECT card_id, pet_name, last4 FROM cards
+                 WHERE card_id = ?1 AND retired_at IS NULL",
+                params![card_id.to_string()],
+                |row| {
+                    let card_id: String = row.get(0)?;
+                    let pet_name: String = row.get(1)?;
+                    let last4: String = row.get(2)?;
+                    Ok((card_id, pet_name, last4))
+                },
+            )
+            .optional()?;
+
+        match row {
+            Some((card_id, pet_name, last4)) => Ok(Some(CardSummary {
+                card_id: card_id
+                    .parse()
+                    .map_err(|_| StoreError::Corrupt("malformed card id"))?,
+                pet_name,
+                last4,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Retire one card. Returns whether it was still active.
+    ///
+    /// Retirement is a soft delete: the row stays so that every payment that
+    /// paid with the card keeps a valid `chosen_card` foreign key (ADR 0007),
+    /// but the card disappears from the approval listing and can no longer be
+    /// chosen. A card named by a payment that has not settled yet is refused —
+    /// that payment may still have to fill with it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::CardInUse`] while a live payment references the card,
+    /// [`StoreError::Sqlite`], [`StoreError::Unavailable`].
+    pub fn retire_card(&self, card_id: CardId) -> Result<bool, StoreError> {
+        let now = now_unix();
+        let mut connection = self.writer.lock().map_err(|_| StoreError::Unavailable)?;
+        let transaction = connection.transaction()?;
+
+        let in_use: bool = transaction.query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM payments
+                 WHERE chosen_card = ?1 AND state IN (?2, ?3, ?4, ?5, ?6)
+             )",
+            params![
+                card_id.to_string(),
+                PaymentState::PendingApproval.as_str(),
+                PaymentState::Approved.as_str(),
+                PaymentState::Filling.as_str(),
+                PaymentState::Submitting.as_str(),
+                PaymentState::AwaitingResultReview.as_str(),
+            ],
+            |row| row.get(0),
         )?;
-        Ok(removed > 0)
+        if in_use {
+            // Dropping the transaction rolls back; nothing was written.
+            return Err(StoreError::CardInUse(card_id));
+        }
+
+        let retired = transaction.execute(
+            "UPDATE cards SET retired_at = ?2, updated_at = ?2
+             WHERE card_id = ?1 AND retired_at IS NULL",
+            params![card_id.to_string(), now],
+        )?;
+        transaction.commit()?;
+        Ok(retired > 0)
     }
 
     /// The append-only transition history for one payment, as
@@ -646,6 +724,25 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
              CREATE UNIQUE INDEX cards_pet_name ON cards (pet_name);
              ALTER TABLE payments ADD COLUMN chosen_card TEXT REFERENCES cards (card_id);
              PRAGMA user_version = 2;
+             COMMIT;",
+        )?;
+        version = 2;
+    }
+
+    if version == 2 {
+        // v3 (ADR 0007, gate review 2026-11-21): cards retire instead of being
+        // deleted. A hard `DELETE` could never run once a payment had chosen
+        // the card (the foreign key), which would leave expired cards in the
+        // approval listing forever. Retiring keeps the payment history valid
+        // and hides the card; the unique pet-name index becomes partial so a
+        // retired name can be reused.
+        connection.execute_batch(
+            "BEGIN;
+             ALTER TABLE cards ADD COLUMN retired_at INTEGER;
+             DROP INDEX cards_pet_name;
+             CREATE UNIQUE INDEX cards_pet_name ON cards (pet_name)
+                 WHERE retired_at IS NULL;
+             PRAGMA user_version = 3;
              COMMIT;",
         )?;
     }

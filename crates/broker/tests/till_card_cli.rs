@@ -215,7 +215,7 @@ fn cli_list_shows_pet_name_and_last4_only() -> TestResult<()> {
 }
 
 #[test]
-fn cli_remove_deletes_a_card() -> TestResult<()> {
+fn cli_remove_retires_a_card() -> TestResult<()> {
     let dir = temp_dir("remove")?;
     let mut add = Command::new(BINARY);
     add.arg("add")
@@ -241,7 +241,15 @@ fn cli_remove_deletes_a_card() -> TestResult<()> {
     let (success, output) = run(&dir, &["remove", &card_id.to_string()], None)?;
 
     assert!(success, "remove succeeds: {output}");
-    assert!(store.cards()?.is_empty(), "the card is gone");
+    assert!(output.contains("retired"), "the command reports retirement");
+    assert!(
+        store.cards()?.is_empty(),
+        "the retired card is no longer offered"
+    );
+    assert!(
+        store.card_blob(card_id)?.is_some(),
+        "the row is kept so payment history stays valid"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())

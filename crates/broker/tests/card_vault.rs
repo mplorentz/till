@@ -16,9 +16,9 @@ use std::sync::{Arc, Mutex};
 
 use broker::{
     ApprovalRequest, BoxFuture, CamofoxPort, CardCipher, CardId, CardRecord, Cart, CartItem,
-    DiscordPort, EngineConfig, FieldKind, FieldSpec, FillRequest, NewPayment, Outcome,
-    PaymentEngine, PaymentEvent, PaymentId, PaymentState, PortError, ResultReviewRequest,
-    SqliteStore, StoreError, TransitionEffect,
+    DiscordPort, EngineConfig, FieldKind, FieldSpec, FillRequest, NewPayment, PaymentEngine,
+    PaymentEvent, PaymentId, PaymentState, PortError, ResultReviewRequest, SqliteStore, StoreError,
+    TransitionEffect,
 };
 
 type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -565,16 +565,15 @@ async fn undecryptable_blob_aborts_before_submit() -> TestResult<()> {
     Ok(())
 }
 
-/// `chosen_card` is a real foreign key, so the card a payment is bound to can
-/// never be deleted out from under it — the fill path cannot find a dangling
-/// reference and silently pay with nothing.
+/// A card that a live payment may still fill with cannot be retired — that
+/// payment has not settled, so the card must stay resolvable (ADR 0007).
 #[tokio::test]
-async fn a_chosen_card_cannot_be_removed() -> TestResult<()> {
-    let harness = Harness::new("fk-chosen")?;
+async fn retiring_a_card_in_use_by_a_live_payment_is_refused() -> TestResult<()> {
+    let harness = Harness::new("retire-live")?;
     let card = harness
         .store
         .add_card(&harness.cipher, "Groceries", &card_record("4444")?)?;
-    let payment_id = harness.create("fk-chosen-key")?;
+    let payment_id = harness.create("retire-live-key")?;
     harness.engine.approve(payment_id, None)?;
     await_state(
         &harness.engine,
@@ -583,13 +582,115 @@ async fn a_chosen_card_cannot_be_removed() -> TestResult<()> {
     )
     .await?;
 
-    let removed = harness.store.remove_card(card.card_id);
+    let refused = harness.store.retire_card(card.card_id);
 
-    assert!(
-        removed.is_err(),
-        "a card bound to a payment cannot be deleted"
+    assert!(matches!(refused, Err(StoreError::CardInUse(id)) if id == card.card_id));
+    assert_eq!(
+        harness.store.cards()?.len(),
+        1,
+        "a refused retirement changes nothing"
     );
-    assert!(harness.store.card_blob(card.card_id)?.is_some());
+    Ok(())
+}
+
+/// Retiring keeps the row (so payment history keeps its foreign key) but takes
+/// the card out of the approval listing and out of the choice resolution.
+#[tokio::test]
+async fn retiring_a_card_hides_it_but_keeps_payment_history() -> TestResult<()> {
+    let harness = Harness::new("retire")?;
+    let card = harness
+        .store
+        .add_card(&harness.cipher, "Groceries", &card_record("4444")?)?;
+    harness
+        .store
+        .add_card(&harness.cipher, "Travel", &card_record("5555")?)?;
+    let payment_id = harness.create("retire-key")?;
+    // Two cards are registered, so the click must name the one to pay with.
+    harness.engine.approve(payment_id, Some(card.card_id))?;
+    await_state(
+        &harness.engine,
+        payment_id,
+        PaymentState::AwaitingResultReview,
+    )
+    .await?;
+    // Settle it, so the card is no longer in use.
+    harness
+        .engine
+        .report_outcome(payment_id, broker::Outcome::FailedNoCharge)?;
+
+    assert!(harness.store.retire_card(card.card_id)?);
+
+    assert_eq!(
+        harness.store.cards()?.len(),
+        1,
+        "a retired card is not offered"
+    );
+    assert!(
+        harness.store.active_card(card.card_id)?.is_none(),
+        "a retired card cannot be chosen"
+    );
+    assert_eq!(
+        harness.store.load(payment_id)?.chosen_card,
+        Some(card.card_id),
+        "the settled payment keeps the card it paid with"
+    );
+    assert!(
+        harness.store.card_blob(card.card_id)?.is_some(),
+        "history stays readable; only the listing hides it"
+    );
+    Ok(())
+}
+
+/// A retired card can never be chosen, and retiring frees its pet name.
+#[tokio::test]
+async fn a_retired_card_cannot_be_chosen_and_its_name_is_reusable() -> TestResult<()> {
+    let harness = Harness::new("retire-reuse")?;
+    let retired = harness
+        .store
+        .add_card(&harness.cipher, "Groceries", &card_record("4444")?)?;
+    assert!(harness.store.retire_card(retired.card_id)?);
+
+    // The partial unique index lets the name come back.
+    let reused = harness
+        .store
+        .add_card(&harness.cipher, "Groceries", &card_record("5555")?)?;
+    let payment_id = harness.create("retire-reuse-key")?;
+
+    assert_eq!(
+        harness.engine.approve(payment_id, Some(retired.card_id))?,
+        broker::DecisionResult::Refused,
+        "a retired card is not a usable choice"
+    );
+    assert_eq!(
+        harness.engine.approve(payment_id, Some(reused.card_id))?,
+        broker::DecisionResult::Applied
+    );
+    Ok(())
+}
+
+/// A failed card-listing read happens *before* anything is persisted: the POST
+/// fails and no half-created payment (no armed hold timer) is left behind
+/// (US-6: a gateway-side failure must never strand a payment).
+#[tokio::test]
+async fn create_payment_fails_cleanly_when_the_listing_is_unreadable() -> TestResult<()> {
+    let harness = Harness::new("listing-failure")?;
+    let connection = rusqlite::Connection::open(&harness.path)?;
+    connection.execute("DROP TABLE cards", [])?;
+    drop(connection);
+
+    let outcome = harness
+        .engine
+        .create_payment(AGENT, request("listing-failure-key"))
+        .await;
+
+    assert!(outcome.is_err(), "the POST reports the failure");
+    assert_eq!(
+        harness
+            .store
+            .find_by_idempotency_key(AGENT, "listing-failure-key")?,
+        None,
+        "no payment row exists without its approval message and hold timer"
+    );
     Ok(())
 }
 
@@ -686,11 +787,4 @@ async fn await_state(
     }
     let actual = engine.view(payment_id)?.state;
     Err(format!("expected {want:?}, still {actual:?}").into())
-}
-
-// Keep the outcome type referenced so the import list matches the module's
-// documented surface.
-#[allow(dead_code)]
-fn _outcome_kinds_are_part_of_the_contract(outcome: Outcome) -> bool {
-    matches!(outcome, Outcome::Ambiguous)
 }

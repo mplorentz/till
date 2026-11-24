@@ -20,7 +20,7 @@ Register a card with one command per card (ADR 0007):
 ```
 docker exec -it till till-card add      # prompted, no echo on number/expiry/cvv
 docker exec -it till till-card list     # id, pet name, last four
-docker exec -it till till-card remove <card-id>
+docker exec -it till till-card remove <card-id>   # retires it; history stays valid
 ```
 
 Card values are never accepted as arguments. The card is stored as ciphertext

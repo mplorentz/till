@@ -50,7 +50,13 @@ prompted fields, `rpassword` for the number/expiry/CVV (no echo), plain
 prompts for the pet name, cardholder name and postcode. The CLI accepts **no**
 card-shaped argument; unknown flags are a usage error, so `--pan` cannot ever
 work. `till-card list` prints `card_id`, pet name and last four — the whole
-listing surface. `till-card remove <card-id>` is the correction path.
+listing surface. `till-card remove <card-id>` is the correction path: it
+**retires** the card (soft delete, `retired_at`) rather than deleting the row,
+because `payments.chosen_card` must keep pointing at the card a payment paid
+with. A retired card disappears from the listing and can never be chosen, and
+its pet name becomes reusable (the unique index is partial). Retirement is
+refused while a payment that has not settled still names the card, since that
+payment may yet have to fill with it.
 
 **Approval.** The card is chosen by the human, in Discord:
 
@@ -107,9 +113,9 @@ committing the submit latch. Any failure is `FillFailed` →
 * A per-card Approve button multiplies buttons with the card set. Ten cards is
   the practical ceiling before a different component shape is needed.
 * Registration is a host-side command: no remote card entry exists, by design.
-* A card deleted from the vault cannot be the `chosen_card` of any payment (the
-  foreign key refuses it), so removing a card never leaves a payment pointing
-  at nothing.
+* Retirement keeps payment history honest: a card that was used is never
+  deleted, so `chosen_card` never dangles; it simply stops being offered.
+  A card still named by an unsettled payment cannot be retired.
 
 ## Alternatives considered
 

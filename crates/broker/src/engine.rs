@@ -188,6 +188,12 @@ impl PaymentEngine {
     ) -> Result<CreateOutcome, EngineError> {
         validate(agent_id, &request)?;
 
+        // The approval message must carry the card listing, and this read must
+        // happen **before** anything is persisted: a failure here would
+        // otherwise leave a payment that exists but never got its hold timer
+        // armed (a gateway-side failure must never fail the POST — US-6).
+        let cards = self.inner.store.cards()?;
+
         // Fast path: the key is already claimed, answer with the original id.
         if let Some(existing) = self
             .inner
@@ -220,10 +226,6 @@ impl PaymentEngine {
         self.inner
             .waiters
             .subscribe(payment_id, PaymentState::PendingApproval);
-
-        // The human picks the card at approval time, so the message carries the
-        // listing: pet name and last four per card, never a card value (ADR 0007).
-        let cards = self.inner.store.cards()?;
 
         // US-6: ask the gateway to post the approval message. A gateway failure
         // must not fail the POST — the payment exists and its hold timer runs;
@@ -308,12 +310,17 @@ impl PaymentEngine {
 
     /// Turn the click's card (or the absence of one) into the card to pay with.
     ///
-    /// `Some(id)` must exist; `None` is only legal when exactly one card is
-    /// registered, in which case that card is selected. `None` otherwise means
-    /// "refuse" — nothing is filled (ADR 0007).
+    /// `Some(id)` must be an **active** card; `None` is only legal when exactly
+    /// one card is active, in which case that card is selected. `None`
+    /// otherwise means "refuse" — nothing is filled (ADR 0007). A retired card
+    /// is never offered, so it is never chosen.
     fn resolve_card_choice(&self, card: Option<CardId>) -> Result<Option<CardId>, StoreError> {
         if let Some(card_id) = card {
-            return Ok(self.inner.store.card_blob(card_id)?.map(|_| card_id));
+            return Ok(self
+                .inner
+                .store
+                .active_card(card_id)?
+                .map(|card| card.card_id));
         }
 
         let cards = self.inner.store.cards()?;
