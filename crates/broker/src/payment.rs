@@ -2,12 +2,18 @@
 //!
 //! # Security boundary
 //!
-//! Nothing in this module (or in this crate) holds a card value. The agent
-//! reports *selectors*, the broker resolves *values* at fill time inside the
-//! Camofox port (AGENTS.md rules 6–7, spec §7, ADR 0005). [`PaymentView`] is
-//! the only response body the HTTP API produces, and it is built from
+//! Nothing in this module holds a card value. The agent reports *selectors*,
+//! the broker resolves *values* at fill time from the card vault
+//! ([`crate::crypto`], AGENTS.md rules 6–7, spec §7, ADR 0002). [`PaymentView`]
+//! is the only response body the HTTP API produces, and it is built from
 //! cart/selector/state metadata only — there is no field on it that could
 //! carry a PAN, expiry or CVV even by mistake.
+//!
+//! The one card-shaped thing here is [`CardSummary`]: a card id, the operator's
+//! pet name, and the last four digits. That is PCI-permissible display data
+//! (overseer requirement 2026-11-21) shown in the approval message so the human
+//! can confirm which card pays; it is not a card value, and it never reaches
+//! the agent-facing API.
 
 use std::fmt;
 use std::str::FromStr;
@@ -54,6 +60,59 @@ impl FromStr for PaymentId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("malformed payment id")]
 pub struct InvalidPaymentId;
+
+/// A registered card's identifier (unguessable, safe to display to the human).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CardId(Uuid);
+
+impl CardId {
+    /// Mint a fresh identifier.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for CardId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for CardId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
+impl FromStr for CardId {
+    type Err = InvalidCardId;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(value).map(Self).map_err(|_| InvalidCardId)
+    }
+}
+
+/// The path segment was not a card id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("malformed card id")]
+pub struct InvalidCardId;
+
+/// What the approval flow may know about a card: pet name and last four.
+///
+/// This is the whole card-listing surface (overseer requirement 2026-11-21).
+/// It carries no PAN, expiry or CVV — only the display data that PCI allows
+/// and the human needs in order to pick.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardSummary {
+    /// The card id, used by the approving click.
+    pub card_id: CardId,
+    /// The operator's pet name for this card.
+    pub pet_name: String,
+    /// The last four digits, for confirmation.
+    pub last4: String,
+}
 
 /// One machine-checkout field the broker is allowed to type into.
 ///

@@ -35,6 +35,11 @@ These follow from the spec (§7, US-14) and override everything else:
    payment — never Discord, API responses, logs, the Hermes plugin, test
    fixtures, or any other process or file. Ciphertext (age blob) is the
    only persisted form.
+   *Display-data carve-out (overseer, 2026-11-21; ADR 0007):* a registered
+   card's **pet name and last four digits** are not card values — they are
+   PCI-permissible display data, stored in clear and shown in the approval
+   message so the human can confirm or choose the card. A PAN, expiry, CVV,
+   cardholder name or postcode still never leaves the broker in any form.
 7. **No card data reaches Camofox without explicit owner approval.**
    Card values are sent to Camofox only when the specific payment is in
    the `approved` state, entered via the single human Approve click on

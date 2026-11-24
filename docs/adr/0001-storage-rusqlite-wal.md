@@ -45,13 +45,16 @@ database file on a mounted volume.
   (unique), `state`, `cart_json`, `tab_id`, `session_key`,
   `fields_json` (selectors + `field_kind` **only — never values**),
   `submit_selector`, `created_at`, `updated_at`, `approval_deadline`,
-  `terminal_reason`.
+  `terminal_reason`, `chosen_card`.
   *Schema note (2026-11-22, bead till-1gt):* the `session_key` column is
-  deferred to the Camofox wiring bead (till-5), together with the
-  `card_blobs` table from ADR 0002. The broker core neither binds a Camofox
-  session nor stores a card value, so neither column would be read or
-  written there; adding them now would be dead schema. `tab_id` is stored
-  from the start because the fill path needs it.
+  deferred to the Camofox wiring bead (till-5). `tab_id` is stored from the
+  start because the fill path needs it.
+  *Schema note (2026-11-21, bead till-7q6):* the `cards` table (ADR 0002) and
+  the `chosen_card` column **landed here**, not with the fill bead — the
+  persistence bead's converged design claimed the vault, and delivering it
+  now keeps till-5 a thin consumer rather than a schema owner. The table is
+  not dead schema: the registration CLI writes it and the approval/fill paths
+  read it. `user_version` is 2. See ADR 0007 for the card-choice shape.
 * One `transitions` append-only table: `(payment_id, from_state,
   to_state, at, reason)` — the state machine is the product, so its
   history is queryable.
@@ -59,8 +62,14 @@ database file on a mounted volume.
   `click` request is issued** (`submitted_at`, `submit_attempted=1`).
   Recovery rule: any row with `submit_attempted=1` and a non-terminal
   state at startup ⇒ `ambiguous`.
-* Card ciphertext lives in a separate table (`card_blobs`) keyed by
-  payment/owner; see ADR 0002.
+* Card ciphertext lives in a separate table (`cards`, one row per registered
+  card) rather than in the payments row; see ADR 0002 and ADR 0007. The
+  approval transition writes `chosen_card` in the same commit as the state.
+
+**Amended 2026-11-21 (bead till-7q6):** the original text said `card_blobs`,
+keyed by payment/owner, would arrive with the fill bead. The vault is instead
+per card and arrives here; the column is `chosen_card`, not a blob column.
+ADR 0002 records the crypto side and ADR 0007 the approval flow.
 
 `rusqlite` is used with the `bundled` feature so the container needs no
 system libsqlite.

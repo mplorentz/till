@@ -18,8 +18,12 @@
 //! * A click we cannot confirm yields `ambiguous`, never a retry (spec §7).
 //! * A hold expiry or a late click can only ever produce `approval_timeout`,
 //!   and no fill has run at that point (US-9).
-//! * Fill is only ever requested from the `approved`/`filling` path, so card
-//!   values cannot be sent speculatively (AGENTS.md rule 7).
+//! * The card is chosen by the **human** at the approval click, and the choice
+//!   is committed in the same transition as the approval (ADR 0007). Fill is
+//!   only ever requested from the approved path, so card values cannot be
+//!   sent speculatively (AGENTS.md rule 7).
+//! * Decryption happens once, in this fill path, and the plaintext is dropped
+//!   as soon as the Camofox fill call returns (ADR 0002).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,7 +31,8 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time::{Instant, sleep_until, timeout_at};
 
-use crate::payment::{NewPayment, Outcome, PaymentId, PaymentView, TerminalReason};
+use crate::crypto::CardCipher;
+use crate::payment::{CardId, NewPayment, Outcome, PaymentId, PaymentView, TerminalReason};
 use crate::ports::{ApprovalRequest, CamofoxPort, DiscordPort, FillRequest, ResultReviewRequest};
 use crate::state::{PaymentEvent, PaymentState};
 use crate::store::{SqliteStore, StoreError, StoredPayment, TransitionEffect, now_unix};
@@ -92,6 +97,12 @@ pub enum DecisionResult {
     /// The payment is not in a state that accepts this click; the gateway must
     /// answer ephemerally and nothing was filled or submitted.
     Expired,
+    /// The click cannot be honoured as sent — no card is registered, several
+    /// are and none was named, or the named card does not exist. The gateway
+    /// answers ephemerally ("pick a card") and nothing was filled or
+    /// submitted. Distinct from [`Self::Expired`] so the human is told the
+    /// truth (ADR 0007).
+    Refused,
 }
 
 /// Anything the engine can refuse.
@@ -117,17 +128,20 @@ struct Inner {
     store: Arc<SqliteStore>,
     camofox: Arc<dyn CamofoxPort>,
     discord: Arc<dyn DiscordPort>,
+    cipher: Arc<CardCipher>,
     config: EngineConfig,
     waiters: WaitRegistry,
 }
 
 impl PaymentEngine {
-    /// Assemble an engine around a store and the two port implementations.
+    /// Assemble an engine around a store, the two port implementations and the
+    /// deployment's card cipher.
     #[must_use]
     pub fn new(
         store: Arc<SqliteStore>,
         camofox: Arc<dyn CamofoxPort>,
         discord: Arc<dyn DiscordPort>,
+        cipher: Arc<CardCipher>,
         config: EngineConfig,
     ) -> Self {
         Self {
@@ -135,6 +149,7 @@ impl PaymentEngine {
                 store,
                 camofox,
                 discord,
+                cipher,
                 config,
                 waiters: WaitRegistry::new(),
             }),
@@ -206,6 +221,10 @@ impl PaymentEngine {
             .waiters
             .subscribe(payment_id, PaymentState::PendingApproval);
 
+        // The human picks the card at approval time, so the message carries the
+        // listing: pet name and last four per card, never a card value (ADR 0007).
+        let cards = self.inner.store.cards()?;
+
         // US-6: ask the gateway to post the approval message. A gateway failure
         // must not fail the POST — the payment exists and its hold timer runs;
         // the human simply will not see a button and the payment will time out.
@@ -216,6 +235,7 @@ impl PaymentEngine {
                 payment_id,
                 cart: &request.cart,
                 approval_deadline: deadline,
+                cards: &cards,
             })
             .await
         {
@@ -232,13 +252,26 @@ impl PaymentEngine {
 
     /// The human clicked Approve (US-7): authorize the fill and start it.
     ///
-    /// Returns [`DecisionResult::Expired`] for a late click, in which case
-    /// nothing is filled and nothing is submitted (US-9).
+    /// `card` is the card the human picked in the approval message. With
+    /// exactly one card registered the gateway may send `None` and the engine
+    /// auto-selects it (overseer requirement 2026-11-21); with several, a
+    /// choice is required — the engine never guesses which card pays.
+    ///
+    /// The choice is committed in the **same** transition as the approval, so
+    /// "approved" and "paying with this card" can never disagree.
+    ///
+    /// Returns [`DecisionResult::Expired`] for a late click (US-9) and
+    /// [`DecisionResult::Refused`] when the click cannot name a usable card;
+    /// in neither case is anything filled or submitted.
     ///
     /// # Errors
     ///
     /// [`EngineError::Store`] if the payment cannot be read or updated.
-    pub fn approve(&self, payment_id: PaymentId) -> Result<DecisionResult, EngineError> {
+    pub fn approve(
+        &self,
+        payment_id: PaymentId,
+        card: Option<CardId>,
+    ) -> Result<DecisionResult, EngineError> {
         let stored = self.inner.store.load(payment_id)?;
         if stored.state != PaymentState::PendingApproval {
             return Ok(DecisionResult::Expired);
@@ -247,11 +280,18 @@ impl PaymentEngine {
             return Ok(DecisionResult::Expired);
         }
 
+        let Some(chosen) = self.resolve_card_choice(card)? else {
+            return Ok(DecisionResult::Refused);
+        };
+
         let approved = match self.inner.store.transition(
             payment_id,
             PaymentState::PendingApproval,
             PaymentEvent::Approve,
-            &TransitionEffect::default(),
+            &TransitionEffect {
+                chosen_card: Some(chosen),
+                ..TransitionEffect::default()
+            },
         ) {
             Ok(stored) => stored,
             // The hold-expiry timer won the race: nothing may be filled.
@@ -264,6 +304,23 @@ impl PaymentEngine {
 
         self.spawn_fill_and_submit(approved);
         Ok(DecisionResult::Applied)
+    }
+
+    /// Turn the click's card (or the absence of one) into the card to pay with.
+    ///
+    /// `Some(id)` must exist; `None` is only legal when exactly one card is
+    /// registered, in which case that card is selected. `None` otherwise means
+    /// "refuse" — nothing is filled (ADR 0007).
+    fn resolve_card_choice(&self, card: Option<CardId>) -> Result<Option<CardId>, StoreError> {
+        if let Some(card_id) = card {
+            return Ok(self.inner.store.card_blob(card_id)?.map(|_| card_id));
+        }
+
+        let cards = self.inner.store.cards()?;
+        match cards.as_slice() {
+            [only] => Ok(Some(only.card_id)),
+            _ => Ok(None),
+        }
     }
 
     /// The human clicked Decline (US-8): nothing is ever filled.
@@ -318,6 +375,7 @@ impl PaymentEngine {
             terminal_reason: Some(TerminalReason::ResultReviewed),
             order_reference: outcome.order_reference().cloned(),
             submit_attempted: false,
+            chosen_card: None,
         };
         match self.inner.store.transition(
             payment_id,
@@ -520,7 +578,7 @@ impl PaymentEngine {
         });
     }
 
-    /// approved → filling → (fill) → submitting (latch) → (click) →
+    /// approved → filling → (decrypt + fill) → submitting (latch) → (click) →
     /// awaiting_result_review.
     async fn run_fill_and_submit(&self, stored: StoredPayment) {
         let payment_id = stored.payment_id;
@@ -535,6 +593,46 @@ impl PaymentEngine {
             return;
         }
 
+        // The card the human chose at the approval click. Without one there is
+        // nothing to type, and nothing has been submitted yet.
+        let Some(chosen) = stored.chosen_card else {
+            self.finish(
+                payment_id,
+                PaymentState::Filling,
+                PaymentEvent::FillFailed,
+                TerminalReason::PreSubmitError,
+            );
+            return;
+        };
+
+        let blob = match self.inner.store.card_blob(chosen) {
+            Ok(Some(blob)) => blob,
+            Ok(None) | Err(_) => {
+                self.finish(
+                    payment_id,
+                    PaymentState::Filling,
+                    PaymentEvent::FillFailed,
+                    TerminalReason::PreSubmitError,
+                );
+                return;
+            }
+        };
+
+        // The one decryption in the broker (ADR 0002, AGENTS.md rule 7).
+        // `card` is dropped — and zeroized — the moment the fill returns.
+        let card = match self.inner.cipher.decrypt(&blob) {
+            Ok(card) => card,
+            Err(_) => {
+                self.finish(
+                    payment_id,
+                    PaymentState::Filling,
+                    PaymentEvent::FillFailed,
+                    TerminalReason::PreSubmitError,
+                );
+                return;
+            }
+        };
+
         let filled = self
             .inner
             .camofox
@@ -542,8 +640,11 @@ impl PaymentEngine {
                 payment_id,
                 tab_id: &stored.tab_id,
                 fields: &stored.fields,
+                card: &card,
             })
             .await;
+        // Plaintext exists only across the fill call above.
+        drop(card);
 
         if filled.is_err() {
             // Pre-submit error: nothing was clicked, so nothing charged.

@@ -18,10 +18,10 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use broker::{
-    ApiKeys, AppState, ApprovalRequest, BoxFuture, CamofoxPort, Cart, CartItem, DiscordPort,
-    EngineConfig, EngineError, FieldKind, FieldSpec, FillRequest, NewPayment, OrderReference,
-    Outcome, PaymentEngine, PaymentEvent, PaymentId, PaymentState, PaymentView, PortError,
-    ResultReviewRequest, SqliteStore, StoreError, TransitionEffect,
+    ApiKeys, AppState, ApprovalRequest, BoxFuture, CamofoxPort, CardCipher, CardRecord, Cart,
+    CartItem, DiscordPort, EngineConfig, EngineError, FieldKind, FieldSpec, FillRequest,
+    NewPayment, OrderReference, Outcome, PaymentEngine, PaymentEvent, PaymentId, PaymentState,
+    PaymentView, PortError, ResultReviewRequest, SqliteStore, StoreError, TransitionEffect,
 };
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
@@ -129,6 +129,7 @@ struct Harness {
     engine: PaymentEngine,
     app: Router,
     driver: Arc<Driver>,
+    cipher: Arc<CardCipher>,
     path: PathBuf,
 }
 
@@ -136,10 +137,15 @@ impl Harness {
     fn new(tag: &str, driver: Arc<Driver>, config: EngineConfig) -> TestResult<Self> {
         let path = temp_db_path(tag);
         let store = Arc::new(SqliteStore::open(&path)?);
+        let cipher = Arc::new(CardCipher::generate());
+        // One card in the vault: the approval auto-selects it, which is the
+        // baseline shape (ADR 0007).
+        store.add_card(&cipher, "Test card", &test_card_record()?)?;
         let engine = PaymentEngine::new(
             Arc::clone(&store),
             Arc::clone(&driver) as Arc<dyn CamofoxPort>,
             Arc::clone(&driver) as Arc<dyn DiscordPort>,
+            Arc::clone(&cipher),
             config,
         );
         let app = broker::router(AppState::new(engine.clone(), keys()?));
@@ -147,6 +153,7 @@ impl Harness {
             engine,
             app,
             driver,
+            cipher,
             path,
         })
     }
@@ -158,6 +165,7 @@ impl Harness {
             Arc::clone(&store),
             Arc::clone(&self.driver) as Arc<dyn CamofoxPort>,
             Arc::clone(&self.driver) as Arc<dyn DiscordPort>,
+            Arc::clone(&self.cipher),
             config,
         ))
     }
@@ -245,6 +253,18 @@ fn cart() -> Cart {
         total: "42.00".to_string(),
         currency: "USD".to_string(),
     }
+}
+
+/// Synthetic card values, built at runtime: no digit run ever appears in
+/// source, which is what `script/no-card-digits` enforces (US-14).
+fn test_card_record() -> TestResult<CardRecord> {
+    Ok(CardRecord::parse(
+        &"4".repeat(16),
+        "12/34",
+        &"1".repeat(3),
+        "Test Holder",
+        &"1".repeat(5),
+    )?)
 }
 
 fn request(idempotency_key: &str) -> NewPayment {
@@ -406,7 +426,7 @@ async fn approve_walks_filling_submitting_to_awaiting_result_review() -> TestRes
     let payment_id = harness.create(&request("approve-key")).await?;
 
     assert_eq!(
-        harness.engine.approve(payment_id)?,
+        harness.engine.approve(payment_id, None)?,
         broker::DecisionResult::Applied
     );
     let view = harness
@@ -429,16 +449,56 @@ async fn approve_walks_filling_submitting_to_awaiting_result_review() -> TestRes
 async fn submit_click_issued_exactly_once() -> TestResult<()> {
     let harness = Harness::new("once", Arc::new(Driver::default()), EngineConfig::default())?;
     let payment_id = harness.create(&request("once-key")).await?;
-    harness.engine.approve(payment_id)?;
+    harness.engine.approve(payment_id, None)?;
     harness
         .await_state(payment_id, PaymentState::AwaitingResultReview)
         .await?;
 
     // A replayed Approve click must not click again (spec §6 stale clicks).
-    let replayed = harness.engine.approve(payment_id)?;
+    let replayed = harness.engine.approve(payment_id, None)?;
 
     assert_eq!(replayed, broker::DecisionResult::Expired);
     assert_eq!(harness.driver.clicks(), 1, "the submit latch holds");
+    Ok(())
+}
+
+/// The latch is on disk, so a restart can never produce a second click: a
+/// fresh process finds the latch committed, recovers the payment as
+/// `ambiguous`, and refuses the replay (US-12, AGENTS.md rule 3).
+#[tokio::test]
+async fn submit_latch_holds_across_restart() -> TestResult<()> {
+    let path = temp_db_path("latch-restart");
+    let store = Arc::new(SqliteStore::open(&path)?);
+    // The exact state a crash between `COMMIT(latch)` and the click leaves.
+    let payment_id = seed_submitting(&store, &request("latch-restart-key"))?;
+    assert!(
+        store.load(payment_id)?.submit_attempted,
+        "the latch was committed before the click"
+    );
+
+    let driver = Arc::new(Driver::default());
+    let restarted = PaymentEngine::new(
+        Arc::clone(&store),
+        Arc::clone(&driver) as Arc<dyn CamofoxPort>,
+        Arc::clone(&driver) as Arc<dyn DiscordPort>,
+        Arc::new(CardCipher::generate()),
+        EngineConfig::default(),
+    );
+    restarted.recover()?;
+
+    assert_eq!(
+        restarted.view(payment_id)?.state,
+        PaymentState::Ambiguous,
+        "a latched payment recovered after restart is ambiguous"
+    );
+    // And a replayed Approve cannot resurrect it or click again.
+    assert_eq!(
+        restarted.approve(payment_id, None)?,
+        broker::DecisionResult::Expired
+    );
+    assert_eq!(driver.clicks(), 0, "the restarted broker never clicks");
+    assert_eq!(driver.fills(), 0, "the restarted broker never fills");
+    remove_db(&path);
     Ok(())
 }
 
@@ -493,7 +553,7 @@ async fn late_approve_after_timeout_is_rejected_nothing_filled() -> TestResult<(
         .await_state(payment_id, PaymentState::ApprovalTimeout)
         .await?;
 
-    let decision = harness.engine.approve(payment_id)?;
+    let decision = harness.engine.approve(payment_id, None)?;
 
     assert_eq!(decision, broker::DecisionResult::Expired, "US-9");
     assert_eq!(harness.driver.fills(), 0, "a late Approve fills nothing");
@@ -535,7 +595,7 @@ async fn camofox_fill_error_aborts_before_submit() -> TestResult<()> {
     let driver = Arc::new(Driver::default().fill_fails());
     let harness = Harness::new("fill-fail", driver, EngineConfig::default())?;
     let payment_id = harness.create(&request("fill-fail-key")).await?;
-    harness.engine.approve(payment_id)?;
+    harness.engine.approve(payment_id, None)?;
 
     let view = harness
         .await_state(payment_id, PaymentState::AbortedBeforeSubmit)
@@ -552,7 +612,7 @@ async fn click_disconnect_yields_ambiguous_never_retry() -> TestResult<()> {
     let driver = Arc::new(Driver::default().click_fails());
     let harness = Harness::new("click-fail", driver, EngineConfig::default())?;
     let payment_id = harness.create(&request("click-fail-key")).await?;
-    harness.engine.approve(payment_id)?;
+    harness.engine.approve(payment_id, None)?;
 
     let view = harness
         .await_state(payment_id, PaymentState::Ambiguous)
@@ -580,6 +640,7 @@ async fn crash_recovery_marks_inflight_submitting_ambiguous() -> TestResult<()> 
         Arc::clone(&store),
         Arc::clone(&driver) as Arc<dyn CamofoxPort>,
         Arc::clone(&driver) as Arc<dyn DiscordPort>,
+        Arc::new(CardCipher::generate()),
         EngineConfig::default(),
     );
     engine.recover()?;
@@ -621,6 +682,7 @@ async fn crash_recovery_aborts_presubmit_and_expires_stale_holds() -> TestResult
         Arc::clone(&store),
         Arc::clone(&driver) as Arc<dyn CamofoxPort>,
         Arc::clone(&driver) as Arc<dyn DiscordPort>,
+        Arc::new(CardCipher::generate()),
         EngineConfig::default(),
     );
     engine.recover()?;
@@ -665,7 +727,7 @@ async fn outcome_buttons_map_to_terminal_states() -> TestResult<()> {
         let payment_id = harness
             .create(&request(&format!("outcome-key-{index}")))
             .await?;
-        harness.engine.approve(payment_id)?;
+        harness.engine.approve(payment_id, None)?;
         harness
             .await_state(payment_id, PaymentState::AwaitingResultReview)
             .await?;
@@ -840,7 +902,7 @@ async fn every_legal_transition_is_recorded_in_history() -> TestResult<()> {
         EngineConfig::default(),
     )?;
     let payment_id = harness.create(&request("history-key")).await?;
-    harness.engine.approve(payment_id)?;
+    harness.engine.approve(payment_id, None)?;
     harness
         .await_state(payment_id, PaymentState::AwaitingResultReview)
         .await?;
@@ -873,7 +935,7 @@ async fn every_legal_transition_is_recorded_in_history() -> TestResult<()> {
 async fn store_rejects_a_foreign_state_change() -> TestResult<()> {
     let harness = Harness::new("cas", Arc::new(Driver::default()), EngineConfig::default())?;
     let payment_id = harness.create(&request("cas-key")).await?;
-    harness.engine.approve(payment_id)?;
+    harness.engine.approve(payment_id, None)?;
     harness
         .await_state(payment_id, PaymentState::AwaitingResultReview)
         .await?;

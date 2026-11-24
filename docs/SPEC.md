@@ -126,6 +126,12 @@ owns all state.
 - `idempotency_key`: agent-generated, dedupes the POST. Does not protect
   against merchant-side duplicate charges.
 
+**The agent never names a card.** The call has no card parameter and never
+will: cards are registered out-of-band by the human
+(`docker exec -it till till-card add`, ADR 0007), and the human chooses which
+one pays at the approval click. The broker supplies the values; the agent
+never sees them, and cannot tell which card was used.
+
 Returns `payment_id` synchronously. Broker immediately captures a
 screenshot and posts the approval request to its configured Discord
 destination.
@@ -149,8 +155,18 @@ and still has a `payment_id` from before.
 - Structured cart summary (from the agent).
 - Broker-captured screenshot of the checkout page (taken at
   approval-request time, not by the agent).
-- Buttons: **Approve** / **Decline**.
+- The card the payment would use, as **pet name + last four** (display data
+  only — ADR 0007). With exactly one card registered it is shown for
+  confirmation and a single **Approve** authorises it (the broker
+  auto-selects). With several registered, each card gets its own
+  **Approve** button labelled with its pet name and last four, and the click
+  carries the choice.
+- Buttons: **Approve** (per card, when there is more than one) / **Decline**.
 - TTL display: when the merchant hold expires.
+
+A click that cannot name a usable card (none registered, or a card that no
+longer exists) is answered ephemerally — "pick a card" / "no card registered"
+— and nothing is filled or submitted.
 
 ### Result-review message (broker → Discord, after submit)
 

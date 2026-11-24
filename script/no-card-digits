@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# US-14 / ADR 0002 audit: card digits must never be committed, logged or
+# printed. A card number is a run of 13-19 digits, so any such run in the
+# code that runs is a leak until proven otherwise.
+#
+# Scope: first-party source, tests, scripts, deployment notes. Excluded:
+#   * Cargo.lock — generated hex checksums legitimately contain long digit runs;
+#   * docs/ — the spec quotes a 19-digit Discord thread id;
+#   * target/ — build output.
+#
+# Test fixtures build card-shaped values at runtime (`"4".repeat(16)`) rather
+# than embedding them, so this check stays strict instead of allowlisting.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+if command -v rg >/dev/null 2>&1; then
+  search() { rg --no-heading --line-number --color never -e "$1" "${@:2}"; }
+else
+  search() { grep -rnE --exclude-dir=target "$1" "${@:2}"; }
+fi
+
+if matches=$(search '[0-9]{13,19}' crates plugin docker script .github AGENTS.md README.md CONTRIBUTING.md 2>/dev/null); then
+  echo "no-card-digits: FAIL — a card-shaped digit run was found:" >&2
+  echo "$matches" >&2
+  echo >&2
+  echo "Card values must never be committed (AGENTS.md rule 1, US-14)." >&2
+  echo "Build test values at runtime, e.g. \"4\".repeat(16)." >&2
+  exit 1
+fi
+
+echo "no-card-digits: clean"

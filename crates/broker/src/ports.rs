@@ -6,30 +6,33 @@
 //! implementations arrive with their own beads (`crates/camofox-client`,
 //! `crates/discord-gw`).
 //!
-//! # Card data boundary (AGENTS.md rules 6–7, ADR 0005)
+//! # Card data boundary (AGENTS.md rules 6–7, ADR 0002/0005/0007)
 //!
-//! [`FillRequest`] deliberately carries **selectors only** — no values. The
-//! engine builds one exactly once, immediately after the payment reached
-//! `approved` through the human's single Approve click, and the Camofox
-//! implementation resolves the actual card values from the encrypted store at
-//! that moment. Two properties fall out of this shape:
+//! [`FillRequest`] is the single egress of decrypted card values. The engine's
+//! fill path resolves the card the human chose at the approval click, decrypts
+//! it, builds one `FillRequest`, hands it to the Camofox implementation, and
+//! drops the record immediately afterwards (zeroize-on-drop). Two properties
+//! fall out of that shape:
 //!
-//! * No card value ever exists in the engine, in a `PaymentView`, in an error,
-//!   or in a log line, because the engine has nowhere to put one.
+//! * No card value exists in the engine outside that one call, in a
+//!   `PaymentView`, in an error, or in a log line — [`crate::crypto::CardRecord`]
+//!   implements no `Debug`, `Display` or `Serialize`, and `FillRequest`'s own
+//!   `Debug` prints a redaction instead of the card.
 //! * "Card data reaches Camofox only for an approved payment" is structural:
-//!   the only constructor of [`FillRequest`] is [`crate::engine`]'s fill path,
-//!   which runs after the `pending_approval → approved` transition.
+//!   the only place a `FillRequest` is built is [`crate::engine`]'s fill path,
+//!   which runs after `pending_approval → approved` was committed with the
+//!   chosen card.
 //!
-//! Today the type is constructible anywhere within the crate (a `pub` struct
-//! with `pub` fields); when the fill implementation lands it should take an
-//! opaque `ApprovedFill` ticket minted by the state machine, which closes that
-//! gap completely.
+//! [`ApprovalRequest`] carries the card *listing* — pet name and last four
+//! only — so the human can pick the card in Discord. That is display data,
+//! not a card value (ADR 0007).
 
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::payment::{Cart, FieldSpec, PaymentId};
+use crate::crypto::CardRecord;
+use crate::payment::{CardSummary, Cart, FieldSpec, PaymentId};
 
 /// A boxed future, so the port traits stay object-safe (`Arc<dyn CamofoxPort>`)
 /// without pulling in `async-trait`.
@@ -41,8 +44,12 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 #[error("payment port unavailable")]
 pub struct PortError;
 
-/// What the broker asks Camofox to type. Selectors only — never values.
-#[derive(Debug, Clone, Copy)]
+/// What the broker asks Camofox to type: the selectors, and the values.
+///
+/// The `card` is the decrypted record for the card the human chose at
+/// approval. It lives no longer than this request: the engine drops it as soon
+/// as [`CamofoxPort::fill_fields`] returns.
+#[derive(Clone, Copy)]
 pub struct FillRequest<'a> {
     /// The payment this fill is for (`approved` by construction).
     pub payment_id: PaymentId,
@@ -50,6 +57,22 @@ pub struct FillRequest<'a> {
     pub tab_id: &'a str,
     /// Where each value goes.
     pub fields: &'a [FieldSpec],
+    /// The values themselves (the chosen card).
+    pub card: &'a CardRecord,
+}
+
+impl fmt::Debug for FillRequest<'_> {
+    /// Prints the selectors and a redaction — never a card value, which is why
+    /// this is hand-written rather than derived (AGENTS.md rule 1).
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FillRequest")
+            .field("payment_id", &self.payment_id)
+            .field("tab_id", &self.tab_id)
+            .field("fields", &self.fields)
+            .field("card", &"<redacted>")
+            .finish()
+    }
 }
 
 /// The Camofox side: fill and submit one payment (spec §7).
@@ -69,8 +92,8 @@ pub trait CamofoxPort: Send + Sync + fmt::Debug {
     ) -> BoxFuture<'a, Result<(), PortError>>;
 }
 
-/// The approval message the gateway must post (spec §6, US-6). Cart and
-/// selectors only — the screenshot is the gateway's business.
+/// The approval message the gateway must post (spec §6, US-6, ADR 0007). Cart,
+/// deadline and the card listing — the screenshot is the gateway's business.
 #[derive(Debug, Clone, Copy)]
 pub struct ApprovalRequest<'a> {
     /// Which payment the buttons belong to.
@@ -79,6 +102,8 @@ pub struct ApprovalRequest<'a> {
     pub cart: &'a Cart,
     /// When the hold expires, for the "TTL display" line (ADR 0004).
     pub approval_deadline: i64,
+    /// The cards the human may pay with: pet name and last four only.
+    pub cards: &'a [CardSummary],
 }
 
 /// The result-review message the gateway must post after submit (spec §6,
