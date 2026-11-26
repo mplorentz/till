@@ -23,6 +23,25 @@ uuid = { version = "1", features = ["serde", "v4"] }
 # Error enums for store/engine/auth. Hand-written `Display` for four enums is
 # noise, and these types never carry card data (AGENTS.md rule 1).
 thiserror = "2"
+# Card encryption at rest (ADR 0002, accepted 2026-11-14): `age` gives one
+# audited primitive (X25519 + ChaCha20-Poly1305) instead of a cipher-suite knob
+# to get wrong, and hand-rolling authenticated encryption would be worse.
+# `armor` is what makes the stored blob visibly an age file to an operator
+# with `sqlite3`. AGENTS.md rule 5 explicitly names card data as a dependency
+# that needs justification; ADR 0002 is that justification.
+age = { version = "0.11", features = ["armor"] }
+# Card plaintext lives in `secrecy::SecretString` (zeroize-on-drop) and the
+# card type implements no Debug/Display/Serialize, which is how rule 1 is
+# enforced by construction rather than by review. ADR 0002 names both crates.
+secrecy = "0.10"
+# `Zeroize`/`ZeroizeOnDrop` derives for the card record (ADR 0002: "secrecy +
+# zeroize in memory"). `zeroize` is already in the tree through `secrecy`;
+# naming it directly is what lets the derive be used here.
+zeroize = { version = "1", features = ["derive"] }
+# Registration CLI input: the PAN, expiry and CVV must not be echoed into a
+# terminal's scrollback, which is a log-disclosure vector under D5. This is a
+# dependency whose entire job is "read a secret without showing it".
+rpassword = "7"
 
 [dev-dependencies]
 # Test-only: drives the router in-process via `tower::ServiceExt::oneshot`

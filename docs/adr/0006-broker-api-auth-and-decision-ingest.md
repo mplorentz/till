@@ -60,10 +60,18 @@ implicit risked till-6 and till-7 inventing incompatible answers.
   take it: it answers `DecisionResult::Expired`, which is the gateway's cue to
   reply ephemerally with "this request has expired" (spec §6) and to fill
   nothing.
-* Approve is the only path that constructs `ports::FillRequest`, and it does
-  so only after the `pending_approval → approved` transition has been
-  committed. Card values are therefore structurally unreachable before
-  approval (AGENTS.md rule 7).
+* **Amended 2026-11-21 (bead till-7q6, ADR 0007):** `approve` carries the
+  human's card choice — `approve(payment_id, Option<CardId>)`. The gateway
+  encodes the card in the button's `custom_id` (`approve:<payment>:<card>`);
+  with exactly one card registered it may send `None` and the engine
+  auto-selects. A click that names no usable card answers
+  `DecisionResult::Refused` ("pick a card"), which is deliberately distinct
+  from `Expired`: the request has not expired, and the human is told the
+  truth. The chosen card is committed in the same transition as the approval.
+* Approve is the only path that can reach a card decryption: it constructs the
+  `FillRequest` only after the `pending_approval → approved` transition has
+  been committed with a `chosen_card`. Card values are therefore structurally
+  unreachable before approval (AGENTS.md rule 7).
 
 ## Consequences
 

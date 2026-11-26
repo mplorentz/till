@@ -8,8 +8,10 @@
 //!
 //! * [`state`] — the state machine itself (spec §4), a pure transition table.
 //! * [`payment`] — the DTOs the agent may send and read back (no card data).
-//! * [`store`] — SQLite persistence, idempotency index, submit-once latch
-//!   (ADR 0001).
+//! * [`store`] — SQLite persistence, idempotency index, submit-once latch,
+//!   the long-term card vault (ADR 0001/0002).
+//! * [`crypto`] — the age cipher: cards in, signed ciphertext out, and the key
+//!   lifecycle (generate once, when absent — ADR 0002).
 //! * [`ports`] — Camofox and Discord behind traits, so the machine is testable
 //!   without either (spec §7).
 //! * [`wait`] — the in-process long-poll registry (ADR 0004).
@@ -19,12 +21,14 @@
 //!
 //! # Security boundary
 //!
-//! Card data never leaves the broker (AGENTS.md rules 6–7, spec §7). This crate
-//! does not hold card values at all: it stores selectors, and the sole egress
-//! of a decrypted value is the Camofox fill call for a payment that reached
-//! `approved` through the human's single Approve click.
+//! Card data never leaves the broker (AGENTS.md rules 6–7, spec §7). Cards live
+//! as age ciphertext in the vault ([`crypto`], [`store`]); the only place a
+//! plaintext card exists is [`crypto::CardRecord`], constructed by the
+//! registration CLI or by [`crypto::CardCipher::decrypt`] inside the engine's
+//! approved fill path, and dropped as soon as the Camofox fill call returns.
 
 pub mod auth;
+pub mod crypto;
 pub mod engine;
 pub mod http;
 pub mod payment;
@@ -34,16 +38,18 @@ pub mod store;
 pub mod wait;
 
 pub use auth::{ApiKeys, AuthConfigError, AuthenticatedAgent};
+pub use crypto::{CardCipher, CardFields, CardRecord, CryptoError};
 pub use engine::{CreateOutcome, DecisionResult, EngineConfig, EngineError, PaymentEngine};
 pub use http::{AppState, CreateResponse, router};
 pub use payment::{
-    Cart, CartItem, FieldKind, FieldSpec, InvalidOrderReference, NewPayment, OrderReference,
-    Outcome, OutcomeKind, PaymentId, PaymentView, TerminalReason,
+    CardId, CardSummary, Cart, CartItem, FieldKind, FieldSpec, InvalidCardId,
+    InvalidOrderReference, NewPayment, OrderReference, Outcome, OutcomeKind, PaymentId,
+    PaymentView, TerminalReason,
 };
 pub use ports::{
     ApprovalRequest, BoxFuture, CamofoxPort, DiscordPort, FillRequest, PortError,
     ResultReviewRequest,
 };
 pub use state::{IllegalTransition, PaymentEvent, PaymentState, transition};
-pub use store::{SqliteStore, StoreError, StoredPayment, TransitionEffect};
+pub use store::{MAX_PET_NAME_LEN, SqliteStore, StoreError, StoredPayment, TransitionEffect};
 pub use wait::WaitRegistry;

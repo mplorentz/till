@@ -42,19 +42,31 @@ refuse to hand card data to a component that writes plaintext traces.
 Encrypt card details with **`age`** (X25519 recipients, ASCII-armored
 blob) and persist **only the ciphertext**.
 
-* One `age` recipient per broker deployment (generated at install,
-  stored outside the database — container secret / mounted file — not in
-  the repo, not in the DB, not in logs).
-* The plaintext card object (`card_number`, `expiry`, `cvv`,
-  `cardholder_name`, `billing_postcode`) is serialized, encrypted to the
-  recipient, and stored as an opaque blob. **No column anywhere holds a
-  PAN, expiry or CVV in plaintext** — not even a last-four. Last-four is
-  derived on demand from the decrypted value when a display string is
-  needed, and is never persisted.
+* **Key lifecycle (amended 2026-11-21, overseer): no manual keygen and no
+external key store.** The broker generates its own `age` identity the first
+time it needs one, writes it to its data volume (`0600`), and reuses it
+forever after (`CardCipher::load_or_generate`). Generate **once, when
+absent** — regenerating on every boot would make every stored card
+undecryptable. Losing the volume means re-entering the cards; the human keeps
+the real cards elsewhere, so that is an acceptable failure, not a payment
+safety event. The D5 tradeoff is unchanged and still the whole claim: this
+defends against environment scraping and log disclosure, **not** against an
+attacker with access to the volume or the container.
+* **One card per row (amended 2026-11-21).** The vault is a small set of
+long-term cards (`cards` table, ADR 0007), not one blob bound to a payment.
+The plaintext card object (`card_number`, `expiry`, `cvv`,
+`cardholder_name`, `billing_postcode`) is serialized, encrypted to the
+recipient, and stored as an opaque blob. **No column holds a PAN, expiry or
+CVV in plaintext.**
+* **Display data carve-out (amended 2026-11-21).** Two card fields *are*
+stored in clear, because the approval flow needs them to name the card: the
+operator's pet name and the **last four digits**. Both are PCI-permissible
+display data — what a receipt or a card sleeve shows. No last-four is derived
+from a stored plaintext PAN, and no other field is stored in clear.
 * Plaintext material is wrapped in `secrecy::SecretString` /
-  `zeroize`-on-drop types, decrypted **only** inside the fill call for a
-  payment in `approved`, and dropped immediately after the Camofox
-  `evaluate` request is built.
+`zeroize`-on-drop types (`crypto::CardRecord`), decrypted **only** inside the
+fill path for a payment in `approved`, and dropped as soon as the Camofox fill
+call returns.
 * `Debug`/`Serialize`/`Display` are not implemented for the card types;
   logging is written so a card value cannot be interpolated into an
   error (`AGENTS.md` rule 1). Card values are never placed in an
@@ -84,11 +96,15 @@ blob) and persist **only the ciphertext**.
 **Bad / accepted costs**
 
 * **Not a defence against container compromise**, and it is not sold as
-  one: the decryption key lives in the same container. D5 says so
-  explicitly; anyone claiming otherwise should read D5 first.
-* The key is a single point of failure: lose the recipient, lose the
-  cards. (Acceptable — cards are re-enterable by the owner; losing them
-  is a support task, not a payment-safety event.)
+  one: the decryption key lives in the same container and now in the same
+  volume as the database. D5 says so explicitly; anyone claiming otherwise
+  should read D5 first.
+* The generated identity is a single point of failure: lose the volume, lose
+the cards. (Accepted 2026-11-21 — cards are re-enterable by the owner; losing
+them is a support task, not a payment-safety event.)
+* The pet name and last four are readable without the key. That is the price
+of naming the card in an approval message; it is display data, not a card
+value.
 * Encrypting on every write adds a decrypt/encrypt round trip in the
   fill path (~ms); irrelevant beside the ~2 s submit click measured in
   the spike.
@@ -96,8 +112,8 @@ blob) and persist **only the ciphertext**.
   authenticated encryption is worse, and because the alternative
   (whole-database encryption) fights the inspectability decision in ADR
   0001.
-* One ciphertext per card set means rotating an individual card is a
-  row rewrite, not an in-place field update.
+* One ciphertext per card means rotating an individual card is a row rewrite,
+  not an in-place field update.
 
 ## Alternatives considered
 

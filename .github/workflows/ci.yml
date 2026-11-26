@@ -23,6 +23,9 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
+      - name: Card-digit audit (US-14)
+        run: ./script/no-card-digits
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 

@@ -6,4 +6,6 @@ cd "$(dirname "$0")/.."
 
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
+# US-14: card digits must never be committed or printed (ADR 0002).
+./script/no-card-digits
 cargo test --workspace

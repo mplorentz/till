@@ -6,21 +6,25 @@
 //! restarts (US-13), and a payment found in flight at boot must be recoverable
 //! without any in-memory history (US-12).
 //!
-//! Schema notes (ADR 0001):
+//! Schema notes (ADR 0001, amended 2026-11-21):
 //!
 //! * `payments` — one row per payment. `(agent_id, idempotency_key)` carries a
 //!   `UNIQUE` index, so dedupe is enforced by SQLite rather than by a
-//!   read-then-write race in application code.
+//!   read-then-write race in application code. `chosen_card` records which
+//!   vault card the human picked at the approval click, set in the same
+//!   commit as `pending_approval → approved`.
 //! * `transitions` — append-only history `(payment_id, from_state, to_state,
 //!   at, reason)`. The state machine is the product, so its history is
 //!   queryable with `sqlite3` during an incident.
 //! * `submit_attempted` / `submitted_at` — the submit-once latch, written and
 //!   committed *before* the click is issued (AGENTS.md rule 3).
-//!
-//! Deferred to later beads, on purpose: `card_blobs` and the `session_key`
-//! column arrive with the fill/Camofox wiring (ADR 0002) — no card value
-//! exists anywhere in this bead's schema, because no card value ever reaches
-//! these three endpoints.
+//! * `cards` — the long-term vault (ADR 0002, amended 2026-11-21): pet name
+//!   and last four in clear (PCI-permissible display data), and the full card
+//!   as an `age` ciphertext blob. No column here holds a PAN, expiry or CVV.
+//!   The blob is written by the registration CLI and decrypted only by the
+//!   engine's approved fill path (`crate::crypto`). Cards are **retired**, not
+//!   deleted (`retired_at`): a payment's `chosen_card` keeps pointing at the
+//!   card it paid with, and a retired card vanishes from the approval listing.
 //!
 //! Concurrency: one write connection behind a mutex (writes are serialized,
 //! transitions are short) and a second connection for reads, so a long-poll
@@ -33,13 +37,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::crypto::CardCipher;
 use crate::payment::{
-    Cart, FieldSpec, NewPayment, OrderReference, PaymentId, PaymentView, TerminalReason,
+    CardId, CardSummary, Cart, FieldSpec, NewPayment, OrderReference, PaymentId, PaymentView,
+    TerminalReason,
 };
 use crate::state::PaymentState;
 
 /// Current schema version (`PRAGMA user_version`).
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 3;
+
+/// Longest accepted pet name.
+pub const MAX_PET_NAME_LEN: usize = 48;
 
 /// One persisted payment, as read back from SQLite.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +77,8 @@ pub struct StoredPayment {
     pub submit_attempted: bool,
     /// When the latch was committed.
     pub submitted_at: Option<i64>,
+    /// The vault card the human chose at the approval click (ADR 0007).
+    pub chosen_card: Option<CardId>,
     /// Unix seconds at which a pending approval expires.
     pub approval_deadline: i64,
     /// Unix seconds the payment was created.
@@ -109,6 +120,8 @@ pub struct TransitionEffect {
     pub order_reference: Option<OrderReference>,
     /// Commit the submit-once latch with this transition (spec §7).
     pub submit_attempted: bool,
+    /// The human's card choice, committed with the approval transition.
+    pub chosen_card: Option<CardId>,
 }
 
 /// Anything that can go wrong in the store. Carries ids and states only — no
@@ -140,12 +153,24 @@ pub enum StoreError {
     /// The idempotency key is already used by this agent.
     #[error("duplicate idempotency key for payment {0}")]
     Duplicate(PaymentId),
+    /// The card is the chosen card of a payment that has not settled yet.
+    #[error("card {0} is in use by a live payment")]
+    CardInUse(CardId),
+    /// A card with this pet name already exists.
+    #[error("a card named {0:?} already exists")]
+    DuplicateCardName(String),
+    /// The pet name is unusable; the string names the rule only.
+    #[error("invalid card name: {0}")]
+    InvalidCardName(&'static str),
     /// A stored row is unreadable.
     #[error("stored payment is corrupt: {0}")]
     Corrupt(&'static str),
     /// The database mutex was poisoned by a panicking writer.
     #[error("payment store is unavailable")]
     Unavailable,
+    /// Card encryption failed while writing the vault.
+    #[error("card encryption failed")]
+    Crypto,
     /// A schema this build does not understand.
     #[error("unsupported schema version {0}")]
     UnsupportedSchema(i64),
@@ -329,7 +354,8 @@ impl SqliteStore {
                  terminal_reason = COALESCE(?5, terminal_reason),
                  order_reference = COALESCE(?6, order_reference),
                  submit_attempted = MAX(submit_attempted, ?7),
-                 submitted_at = COALESCE(submitted_at, ?8)
+                 submitted_at = COALESCE(submitted_at, ?8),
+                 chosen_card = COALESCE(?9, chosen_card)
              WHERE payment_id = ?1 AND state = ?2",
             params![
                 payment_id.to_string(),
@@ -340,6 +366,7 @@ impl SqliteStore {
                 effect.order_reference.as_ref().map(OrderReference::as_str),
                 i64::from(effect.submit_attempted),
                 effect.submit_attempted.then_some(now),
+                effect.chosen_card.map(|card_id| card_id.to_string()),
             ],
         )?;
 
@@ -403,6 +430,203 @@ impl SqliteStore {
         Ok(payments)
     }
 
+    /// Register one card in the long-term vault (ADR 0002, ADR 0007).
+    ///
+    /// The full card is encrypted before it reaches SQLite; only the pet name
+    /// and the last four digits are stored in clear. One `docker exec` per
+    /// card — this is the only write path into `cards`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::InvalidCardName`], [`StoreError::DuplicateCardName`],
+    /// [`StoreError::Crypto`], [`StoreError::Unavailable`].
+    pub fn add_card(
+        &self,
+        cipher: &CardCipher,
+        pet_name: &str,
+        card: &crate::crypto::CardRecord,
+    ) -> Result<CardSummary, StoreError> {
+        let pet_name = pet_name.trim();
+        if pet_name.is_empty() {
+            return Err(StoreError::InvalidCardName("must not be empty"));
+        }
+        if pet_name.len() > MAX_PET_NAME_LEN {
+            return Err(StoreError::InvalidCardName("must be at most 48 bytes"));
+        }
+
+        let card_id = CardId::new();
+        let last4 = card.last4();
+        let blob = cipher.encrypt(card).map_err(|_| StoreError::Crypto)?;
+        let now = now_unix();
+
+        let mut connection = self.writer.lock().map_err(|_| StoreError::Unavailable)?;
+        let transaction = connection.transaction()?;
+        let inserted = transaction.execute(
+            "INSERT INTO cards (card_id, pet_name, last4, blob, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![card_id.to_string(), pet_name, last4, blob, now],
+        );
+
+        match inserted {
+            Ok(_) => {
+                transaction.commit()?;
+                Ok(CardSummary {
+                    card_id,
+                    pet_name: pet_name.to_string(),
+                    last4,
+                })
+            }
+            Err(error) if is_unique_violation(&error) => {
+                Err(StoreError::DuplicateCardName(pet_name.to_string()))
+            }
+            Err(error) => Err(StoreError::Sqlite(error)),
+        }
+    }
+
+    /// The card-listing surface the approval flow renders: id, pet name,
+    /// last four. Never a card value (ADR 0007, spec §6).
+    ///
+    /// Retired cards are not listed: they are kept only so the payments that
+    /// used them keep their `chosen_card` reference.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sqlite`], [`StoreError::Unavailable`].
+    pub fn cards(&self) -> Result<Vec<CardSummary>, StoreError> {
+        let connection = self.reader.lock().map_err(|_| StoreError::Unavailable)?;
+        let mut statement = connection.prepare(
+            "SELECT card_id, pet_name, last4 FROM cards
+             WHERE retired_at IS NULL
+             ORDER BY pet_name ASC, created_at ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let card_id: String = row.get(0)?;
+            let pet_name: String = row.get(1)?;
+            let last4: String = row.get(2)?;
+            Ok((card_id, pet_name, last4))
+        })?;
+
+        let mut cards = Vec::new();
+        for row in rows {
+            let (card_id, pet_name, last4) = row?;
+            let card_id = card_id
+                .parse()
+                .map_err(|_| StoreError::Corrupt("malformed card id"))?;
+            cards.push(CardSummary {
+                card_id,
+                pet_name,
+                last4,
+            });
+        }
+        Ok(cards)
+    }
+
+    /// One card's ciphertext, or `None` when it is not registered.
+    ///
+    /// Ciphertext only: reading it is harmless by construction, decrypting it
+    /// is [`crate::crypto::CardCipher::decrypt`]'s job inside the approved
+    /// fill path. This deliberately does **not** filter retired cards: a
+    /// payment that was approved with a card must still be able to finish
+    /// filling with it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sqlite`], [`StoreError::Unavailable`].
+    pub fn card_blob(&self, card_id: CardId) -> Result<Option<Vec<u8>>, StoreError> {
+        let connection = self.reader.lock().map_err(|_| StoreError::Unavailable)?;
+        let blob: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT blob FROM cards WHERE card_id = ?1",
+                params![card_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(blob)
+    }
+
+    /// One **active** card's summary, or `None` when it does not exist or has
+    /// been retired.
+    ///
+    /// The approval flow must not offer a retired card, so this is what a
+    /// click's explicit choice is resolved against (ADR 0007).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sqlite`], [`StoreError::Unavailable`].
+    pub fn active_card(&self, card_id: CardId) -> Result<Option<CardSummary>, StoreError> {
+        let connection = self.reader.lock().map_err(|_| StoreError::Unavailable)?;
+        let row = connection
+            .query_row(
+                "SELECT card_id, pet_name, last4 FROM cards
+                 WHERE card_id = ?1 AND retired_at IS NULL",
+                params![card_id.to_string()],
+                |row| {
+                    let card_id: String = row.get(0)?;
+                    let pet_name: String = row.get(1)?;
+                    let last4: String = row.get(2)?;
+                    Ok((card_id, pet_name, last4))
+                },
+            )
+            .optional()?;
+
+        match row {
+            Some((card_id, pet_name, last4)) => Ok(Some(CardSummary {
+                card_id: card_id
+                    .parse()
+                    .map_err(|_| StoreError::Corrupt("malformed card id"))?,
+                pet_name,
+                last4,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Retire one card. Returns whether it was still active.
+    ///
+    /// Retirement is a soft delete: the row stays so that every payment that
+    /// paid with the card keeps a valid `chosen_card` foreign key (ADR 0007),
+    /// but the card disappears from the approval listing and can no longer be
+    /// chosen. A card named by a payment that has not settled yet is refused —
+    /// that payment may still have to fill with it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::CardInUse`] while a live payment references the card,
+    /// [`StoreError::Sqlite`], [`StoreError::Unavailable`].
+    pub fn retire_card(&self, card_id: CardId) -> Result<bool, StoreError> {
+        let now = now_unix();
+        let mut connection = self.writer.lock().map_err(|_| StoreError::Unavailable)?;
+        let transaction = connection.transaction()?;
+
+        let in_use: bool = transaction.query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM payments
+                 WHERE chosen_card = ?1 AND state IN (?2, ?3, ?4, ?5, ?6)
+             )",
+            params![
+                card_id.to_string(),
+                PaymentState::PendingApproval.as_str(),
+                PaymentState::Approved.as_str(),
+                PaymentState::Filling.as_str(),
+                PaymentState::Submitting.as_str(),
+                PaymentState::AwaitingResultReview.as_str(),
+            ],
+            |row| row.get(0),
+        )?;
+        if in_use {
+            // Dropping the transaction rolls back; nothing was written.
+            return Err(StoreError::CardInUse(card_id));
+        }
+
+        let retired = transaction.execute(
+            "UPDATE cards SET retired_at = ?2, updated_at = ?2
+             WHERE card_id = ?1 AND retired_at IS NULL",
+            params![card_id.to_string(), now],
+        )?;
+        transaction.commit()?;
+        Ok(retired > 0)
+    }
+
     /// The append-only transition history for one payment, as
     /// `(from, to, reason)` triples — the debugging view ADR 0001 promises.
     pub fn history(
@@ -433,53 +657,96 @@ impl SqliteStore {
 
 const SELECT_COLUMNS: &str = "payment_id, agent_id, idempotency_key, state, cart_json, tab_id, \
      fields_json, submit_selector, terminal_reason, order_reference, submit_attempted, \
-     submitted_at, approval_deadline, created_at, updated_at";
+     submitted_at, chosen_card, approval_deadline, created_at, updated_at";
 
 fn migrate(connection: &Connection) -> Result<(), StoreError> {
-    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version == SCHEMA_VERSION {
         return Ok(());
     }
-    if version != 0 {
+    if !(0..=SCHEMA_VERSION).contains(&version) {
         return Err(StoreError::UnsupportedSchema(version));
     }
 
-    connection.execute_batch(
-        "BEGIN;
-         CREATE TABLE payments (
-             payment_id        TEXT PRIMARY KEY,
-             agent_id          TEXT NOT NULL,
-             idempotency_key   TEXT NOT NULL,
-             state             TEXT NOT NULL,
-             cart_json         TEXT NOT NULL,
-             tab_id            TEXT NOT NULL,
-             fields_json       TEXT NOT NULL,
-             submit_selector   TEXT NOT NULL,
-             terminal_reason   TEXT,
-             order_reference   TEXT,
-             submit_attempted  INTEGER NOT NULL DEFAULT 0,
-             submitted_at      INTEGER,
-             approval_deadline INTEGER NOT NULL,
-             created_at        INTEGER NOT NULL,
-             updated_at        INTEGER NOT NULL
-         );
-         CREATE UNIQUE INDEX payments_idempotency
-             ON payments (agent_id, idempotency_key);
-         CREATE INDEX payments_state ON payments (state);
+    if version == 0 {
+        connection.execute_batch(
+            "BEGIN;
+             CREATE TABLE payments (
+                 payment_id        TEXT PRIMARY KEY,
+                 agent_id          TEXT NOT NULL,
+                 idempotency_key   TEXT NOT NULL,
+                 state             TEXT NOT NULL,
+                 cart_json         TEXT NOT NULL,
+                 tab_id            TEXT NOT NULL,
+                 fields_json       TEXT NOT NULL,
+                 submit_selector   TEXT NOT NULL,
+                 terminal_reason   TEXT,
+                 order_reference   TEXT,
+                 submit_attempted  INTEGER NOT NULL DEFAULT 0,
+                 submitted_at      INTEGER,
+                 approval_deadline INTEGER NOT NULL,
+                 created_at        INTEGER NOT NULL,
+                 updated_at        INTEGER NOT NULL
+             );
+             CREATE UNIQUE INDEX payments_idempotency
+                 ON payments (agent_id, idempotency_key);
+             CREATE INDEX payments_state ON payments (state);
 
-         CREATE TABLE transitions (
-             seq        INTEGER PRIMARY KEY AUTOINCREMENT,
-             payment_id TEXT NOT NULL REFERENCES payments (payment_id),
-             from_state TEXT NOT NULL,
-             to_state   TEXT NOT NULL,
-             at         INTEGER NOT NULL,
-             reason     TEXT
-         );
-         CREATE INDEX transitions_payment ON transitions (payment_id, seq);
+             CREATE TABLE transitions (
+                 seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+                 payment_id TEXT NOT NULL REFERENCES payments (payment_id),
+                 from_state TEXT NOT NULL,
+                 to_state   TEXT NOT NULL,
+                 at         INTEGER NOT NULL,
+                 reason     TEXT
+             );
+             CREATE INDEX transitions_payment ON transitions (payment_id, seq);
 
-         PRAGMA user_version = 1;
-         COMMIT;",
-    )?;
+             PRAGMA user_version = 1;
+             COMMIT;",
+        )?;
+        version = 1;
+    }
+
+    if version == 1 {
+        // v2 (ADR 0002/ADR 0007, 2026-11-21): the long-term card vault, and
+        // the card the human chose at the approval click.
+        connection.execute_batch(
+            "BEGIN;
+             CREATE TABLE cards (
+                 card_id    TEXT PRIMARY KEY,
+                 pet_name   TEXT NOT NULL,
+                 last4      TEXT NOT NULL CHECK (length(last4) = 4),
+                 blob       BLOB NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );
+             CREATE UNIQUE INDEX cards_pet_name ON cards (pet_name);
+             ALTER TABLE payments ADD COLUMN chosen_card TEXT REFERENCES cards (card_id);
+             PRAGMA user_version = 2;
+             COMMIT;",
+        )?;
+        version = 2;
+    }
+
+    if version == 2 {
+        // v3 (ADR 0007, gate review 2026-11-21): cards retire instead of being
+        // deleted. A hard `DELETE` could never run once a payment had chosen
+        // the card (the foreign key), which would leave expired cards in the
+        // approval listing forever. Retiring keeps the payment history valid
+        // and hides the card; the unique pet-name index becomes partial so a
+        // retired name can be reused.
+        connection.execute_batch(
+            "BEGIN;
+             ALTER TABLE cards ADD COLUMN retired_at INTEGER;
+             DROP INDEX cards_pet_name;
+             CREATE UNIQUE INDEX cards_pet_name ON cards (pet_name)
+                 WHERE retired_at IS NULL;
+             PRAGMA user_version = 3;
+             COMMIT;",
+        )?;
+    }
+
     Ok(())
 }
 
@@ -496,9 +763,10 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<StoredPayment,
     let order_reference: Option<String> = row.get(9)?;
     let submit_attempted: i64 = row.get(10)?;
     let submitted_at: Option<i64> = row.get(11)?;
-    let approval_deadline: i64 = row.get(12)?;
-    let created_at: i64 = row.get(13)?;
-    let updated_at: i64 = row.get(14)?;
+    let chosen_card: Option<String> = row.get(12)?;
+    let approval_deadline: i64 = row.get(13)?;
+    let created_at: i64 = row.get(14)?;
+    let updated_at: i64 = row.get(15)?;
 
     Ok(decode_payment(DecodedRow {
         payment_id,
@@ -513,6 +781,7 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<StoredPayment,
         order_reference,
         submit_attempted,
         submitted_at,
+        chosen_card,
         approval_deadline,
         created_at,
         updated_at,
@@ -532,6 +801,7 @@ struct DecodedRow {
     order_reference: Option<String>,
     submit_attempted: i64,
     submitted_at: Option<i64>,
+    chosen_card: Option<String>,
     approval_deadline: i64,
     created_at: i64,
     updated_at: i64,
@@ -567,6 +837,9 @@ fn decode_payment(row: DecodedRow) -> Result<StoredPayment, StoreError> {
             .and_then(|raw| TerminalReason::parse(&raw)),
         submit_attempted: row.submit_attempted != 0,
         submitted_at: row.submitted_at,
+        // Written from a `CardId`; a bad row degrades to "no card chosen"
+        // rather than failing the read (the fill path then aborts cleanly).
+        chosen_card: row.chosen_card.and_then(|raw| raw.parse().ok()),
         approval_deadline: row.approval_deadline,
         created_at: row.created_at,
         updated_at: row.updated_at,
