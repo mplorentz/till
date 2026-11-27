@@ -9,3 +9,28 @@ version.workspace = true
 workspace = true
 
 [dependencies]
+# The port traits and DTOs this crate implements against (`CamofoxPort`,
+# `FillRequest`, `FieldSpec`). Same workspace, no new supply chain.
+broker = { path = "../broker" }
+# The HTTP client for the camofox REST API. `default-features = false` with
+# only `json` keeps TLS out of the tree: camofox is reached over plain HTTP on
+# the docker bridge (spike Environment). Writing an HTTP/1.1 client by hand
+# would be a worse trade — AGENTS.md rule 5 asks for justification, and the
+# justified option is the audited client rather than hand-rolled framing.
+# This crate sends card values in exactly one place (the `/type` fill path) and
+# `reqwest` never logs a request body.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# The camofox access key (ADR 0005 Tier 1) lives in a zeroizing, redacting
+# wrapper so a `Debug` of the configuration cannot print it.
+secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+# Test-only: the in-process fake camofox in tests/fill_engine.rs is an axum
+# router on an ephemeral port, so the tests exercise the real HTTP client
+# without a browser. `axum` is already in the workspace tree.
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }

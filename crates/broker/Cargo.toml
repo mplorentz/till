@@ -48,3 +48,10 @@ rpassword = "7"
 # instead of spawning a server and pulling in an HTTP client. `tower` is
 # already in the dependency tree through axum; see AGENTS.md rule 5.
 tower = { version = "0.5", features = ["util"] }
+# Test-only, for `tests/e2e_mock_checkout.rs`: the four-mode mock site is stood
+# up in-process (spec §9) and the browser is driven through the real Camofox
+# client (bead till-ipx). Workspace crates, so no new supply chain.
+mock-checkout = { path = "../mock-checkout" }
+camofox-client = { path = "../camofox-client" }
+# Test-only: `tokio::net` for the mock site's ephemeral listener in that test.
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }

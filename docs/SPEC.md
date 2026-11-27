@@ -298,7 +298,8 @@ once per payment, including across broker restarts.
   configured Discord destination with the structured cart and
   Approve/Decline buttons.
 - **US-7.** As the broker, when the human clicks Approve, I fill the card
-  fields via Camofox `evaluate` and click submit exactly once.
+  fields via Camofox `/type` (one supervised pass, one `/type` per field —
+  ADR 0005 Decision 3 as amended, ADR 0008) and click submit exactly once.
 - **US-8.** As the broker, when the human clicks Decline, I transition
   to `declined` and never touch the card fields.
 - **US-9.** As the broker, when the approval TTL elapses with no

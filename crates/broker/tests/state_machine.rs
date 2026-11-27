@@ -21,7 +21,8 @@ use broker::{
     ApiKeys, AppState, ApprovalRequest, BoxFuture, CamofoxPort, CardCipher, CardRecord, Cart,
     CartItem, DiscordPort, EngineConfig, EngineError, FieldKind, FieldSpec, FillRequest,
     NewPayment, OrderReference, Outcome, PaymentEngine, PaymentEvent, PaymentId, PaymentState,
-    PaymentView, PortError, ResultReviewRequest, SqliteStore, StoreError, TransitionEffect,
+    PaymentView, PortError, ResultReviewRequest, ScreenshotStore, SqliteStore, StoreError,
+    TransitionEffect,
 };
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
@@ -43,6 +44,10 @@ struct Driver {
     clicks: Mutex<Vec<PaymentId>>,
     approvals: Mutex<Vec<PaymentId>>,
     reviews: Mutex<Vec<PaymentId>>,
+    settles: Mutex<Vec<PaymentId>>,
+    captures: Mutex<Vec<PaymentId>>,
+    containments: Mutex<Vec<PaymentId>>,
+    capture_png: Mutex<Vec<u8>>,
     fill_fails: AtomicBool,
     click_fails: AtomicBool,
 }
@@ -82,6 +87,24 @@ impl Driver {
     fn reviews(&self) -> usize {
         self.reviews.lock().map(|ids| ids.len()).unwrap_or_default()
     }
+
+    fn containments(&self) -> usize {
+        self.containments
+            .lock()
+            .map(|ids| ids.len())
+            .unwrap_or_default()
+    }
+
+    fn settle_count(&self) -> usize {
+        self.settles.lock().map(|ids| ids.len()).unwrap_or_default()
+    }
+
+    fn capture_count(&self) -> usize {
+        self.captures
+            .lock()
+            .map(|ids| ids.len())
+            .unwrap_or_default()
+    }
 }
 
 impl CamofoxPort for Driver {
@@ -100,6 +123,39 @@ impl CamofoxPort for Driver {
         Self::record(&self.clicks, payment_id);
         let fails = self.click_fails.load(Ordering::Relaxed);
         Box::pin(async move { if fails { Err(PortError) } else { Ok(()) } })
+    }
+
+    fn wait_for_settle<'a>(
+        &'a self,
+        payment_id: PaymentId,
+        _tab_id: &'a str,
+    ) -> BoxFuture<'a, Result<(), PortError>> {
+        Self::record(&self.settles, payment_id);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn capture_masked_result<'a>(
+        &'a self,
+        payment_id: PaymentId,
+        _tab_id: &'a str,
+        _fields: &'a [FieldSpec],
+    ) -> BoxFuture<'a, Result<Vec<u8>, PortError>> {
+        Self::record(&self.captures, payment_id);
+        let png = self
+            .capture_png
+            .lock()
+            .map(|bytes| bytes.clone())
+            .unwrap_or_default();
+        Box::pin(async move { Ok(png) })
+    }
+
+    fn contain_tab<'a>(
+        &'a self,
+        payment_id: PaymentId,
+        _tab_id: &'a str,
+    ) -> BoxFuture<'a, Result<(), PortError>> {
+        Self::record(&self.containments, payment_id);
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -130,6 +186,8 @@ struct Harness {
     app: Router,
     driver: Arc<Driver>,
     cipher: Arc<CardCipher>,
+    artifacts: Arc<ScreenshotStore>,
+    artifacts_dir: PathBuf,
     path: PathBuf,
 }
 
@@ -141,11 +199,14 @@ impl Harness {
         // One card in the vault: the approval auto-selects it, which is the
         // baseline shape (ADR 0007).
         store.add_card(&cipher, "Test card", &test_card_record()?)?;
+        let artifacts_dir = temp_artifacts_dir(tag);
+        let artifacts = Arc::new(ScreenshotStore::open(&artifacts_dir)?);
         let engine = PaymentEngine::new(
             Arc::clone(&store),
             Arc::clone(&driver) as Arc<dyn CamofoxPort>,
             Arc::clone(&driver) as Arc<dyn DiscordPort>,
             Arc::clone(&cipher),
+            Arc::clone(&artifacts),
             config,
         );
         let app = broker::router(AppState::new(engine.clone(), keys()?));
@@ -154,6 +215,8 @@ impl Harness {
             app,
             driver,
             cipher,
+            artifacts,
+            artifacts_dir,
             path,
         })
     }
@@ -166,6 +229,7 @@ impl Harness {
             Arc::clone(&self.driver) as Arc<dyn CamofoxPort>,
             Arc::clone(&self.driver) as Arc<dyn DiscordPort>,
             Arc::clone(&self.cipher),
+            Arc::clone(&self.artifacts),
             config,
         ))
     }
@@ -220,6 +284,7 @@ impl Harness {
 impl Drop for Harness {
     fn drop(&mut self) {
         remove_db(&self.path);
+        let _ = std::fs::remove_dir_all(&self.artifacts_dir);
     }
 }
 
@@ -230,6 +295,15 @@ fn remove_db(path: &std::path::Path) {
         file.push(suffix);
         let _ = std::fs::remove_file(file);
     }
+}
+
+fn temp_artifacts_dir(tag: &str) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "broker-test-artifacts-{tag}-{}-{seq}",
+        std::process::id()
+    ))
 }
 
 fn temp_db_path(tag: &str) -> PathBuf {
@@ -442,6 +516,16 @@ async fn approve_walks_filling_submitting_to_awaiting_result_review() -> TestRes
     assert_eq!(harness.driver.clicks(), 1, "one click, exactly once");
     assert_eq!(harness.driver.reviews(), 1, "US-10: the human is asked");
     assert!(harness.engine.store().load(payment_id)?.submit_attempted);
+    assert_eq!(
+        harness.driver.settle_count(),
+        1,
+        "the page settles before the capture"
+    );
+    assert_eq!(
+        harness.driver.capture_count(),
+        1,
+        "exactly one masked capture per payment"
+    );
     Ok(())
 }
 
@@ -482,6 +566,7 @@ async fn submit_latch_holds_across_restart() -> TestResult<()> {
         Arc::clone(&driver) as Arc<dyn CamofoxPort>,
         Arc::clone(&driver) as Arc<dyn DiscordPort>,
         Arc::new(CardCipher::generate()),
+        Arc::new(ScreenshotStore::open(temp_artifacts_dir("latch-restart"))?),
         EngineConfig::default(),
     );
     restarted.recover()?;
@@ -641,6 +726,7 @@ async fn crash_recovery_marks_inflight_submitting_ambiguous() -> TestResult<()> 
         Arc::clone(&driver) as Arc<dyn CamofoxPort>,
         Arc::clone(&driver) as Arc<dyn DiscordPort>,
         Arc::new(CardCipher::generate()),
+        Arc::new(ScreenshotStore::open(temp_artifacts_dir("recovery"))?),
         EngineConfig::default(),
     );
     engine.recover()?;
@@ -683,6 +769,9 @@ async fn crash_recovery_aborts_presubmit_and_expires_stale_holds() -> TestResult
         Arc::clone(&driver) as Arc<dyn CamofoxPort>,
         Arc::clone(&driver) as Arc<dyn DiscordPort>,
         Arc::new(CardCipher::generate()),
+        Arc::new(ScreenshotStore::open(temp_artifacts_dir(
+            "recovery-presubmit",
+        ))?),
         EngineConfig::default(),
     );
     engine.recover()?;
@@ -744,6 +833,21 @@ async fn outcome_buttons_map_to_terminal_states() -> TestResult<()> {
             PaymentState::Ambiguous
         ],
         "each button has its own terminal state (spec §6)"
+    );
+
+    // spec §7: every settled payment's tab is released as `about:blank`, so a
+    // card value cannot be read back out of the page. Containment is
+    // fire-and-forget, so wait for the spawned tasks.
+    for _ in 0..500 {
+        if harness.driver.containments() == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        harness.driver.containments(),
+        3,
+        "each terminal outcome contains its tab exactly once"
     );
     Ok(())
 }

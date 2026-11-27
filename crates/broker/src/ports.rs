@@ -75,12 +75,21 @@ impl fmt::Debug for FillRequest<'_> {
     }
 }
 
-/// The Camofox side: fill and submit one payment (spec §7).
+/// The Camofox side: fill, submit, mask, capture and contain one payment
+/// (spec §7, ADR 0005, ADR 0008).
 ///
-/// Implementors must fill via `POST /tabs/:id/type` and must never use
-/// `evaluate` to carry card digits (ADR 0005).
+/// The engine owns the *order* of these calls (it is the state machine); the
+/// implementation owns the mechanics. Two properties are enforced by the
+/// shape of the trait rather than by review:
+///
+/// * **Fill uses `/type`, never `evaluate`.** Card digits leave the broker only
+///   through [`CamofoxPort::fill_fields`] (ADR 0005 Decision 3).
+/// * **Pixels only ever leave through masking.** [`CamofoxPort::capture_masked_result`]
+///   is the sole method that returns an image, and it must clear the payment
+///   fields before capturing (AGENTS.md rule 4, US-10).
 pub trait CamofoxPort: Send + Sync + fmt::Debug {
-    /// Type every field of the request into `tab_id`.
+    /// Type every field of the request into `tab_id` — one supervised pass,
+    /// never retried (ADR 0005 Decision 2.1).
     fn fill_fields<'a>(&'a self, request: FillRequest<'a>) -> BoxFuture<'a, Result<(), PortError>>;
 
     /// Click the submit button exactly once (spec §7).
@@ -89,6 +98,35 @@ pub trait CamofoxPort: Send + Sync + fmt::Debug {
         payment_id: PaymentId,
         tab_id: &'a str,
         submit_selector: &'a str,
+    ) -> BoxFuture<'a, Result<(), PortError>>;
+
+    /// Wait for the page to settle after the submit click, with a broker-side
+    /// bound. Failures never change the state: the click is already confirmed.
+    fn wait_for_settle<'a>(
+        &'a self,
+        payment_id: PaymentId,
+        tab_id: &'a str,
+    ) -> BoxFuture<'a, Result<(), PortError>>;
+
+    /// Clear or mask the payment fields, **then** capture the page, returning
+    /// the raw PNG bytes.
+    ///
+    /// Masking is fused to capture so "masked before every screenshot that
+    /// leaves the broker" (US-10) is not a caller obligation. `fields` carries
+    /// selectors only — no card value is needed to clear a field.
+    fn capture_masked_result<'a>(
+        &'a self,
+        payment_id: PaymentId,
+        tab_id: &'a str,
+        fields: &'a [FieldSpec],
+    ) -> BoxFuture<'a, Result<Vec<u8>, PortError>>;
+
+    /// Navigate the tab to `about:blank` so the agent cannot read the page
+    /// back after the payment settles (spec §7 structural property).
+    fn contain_tab<'a>(
+        &'a self,
+        payment_id: PaymentId,
+        tab_id: &'a str,
     ) -> BoxFuture<'a, Result<(), PortError>>;
 }
 
@@ -107,8 +145,10 @@ pub struct ApprovalRequest<'a> {
 }
 
 /// The result-review message the gateway must post after submit (spec §6,
-/// US-10). Payment id + cart only: any screenshot must be captured and masked
-/// by the gateway/fill bead, never by the engine.
+/// US-10). Payment id + cart only: the engine masks and captures the
+/// screenshot itself ([`CamofoxPort::capture_masked_result`]) and leaves it in
+/// the broker's artifact store, keyed by payment id — the gateway reads it
+/// from there (ADR 0008).
 #[derive(Debug, Clone, Copy)]
 pub struct ResultReviewRequest<'a> {
     /// Which payment the outcome buttons belong to.

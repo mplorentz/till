@@ -17,8 +17,8 @@ use std::sync::{Arc, Mutex};
 use broker::{
     ApprovalRequest, BoxFuture, CamofoxPort, CardCipher, CardId, CardRecord, Cart, CartItem,
     DiscordPort, EngineConfig, FieldKind, FieldSpec, FillRequest, NewPayment, PaymentEngine,
-    PaymentEvent, PaymentId, PaymentState, PortError, ResultReviewRequest, SqliteStore, StoreError,
-    TransitionEffect,
+    PaymentEvent, PaymentId, PaymentState, PortError, ResultReviewRequest, ScreenshotStore,
+    SqliteStore, StoreError, TransitionEffect,
 };
 
 type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -97,6 +97,32 @@ impl CamofoxPort for Driver {
         }
         Box::pin(async { Ok(()) })
     }
+
+    fn wait_for_settle<'a>(
+        &'a self,
+        _payment_id: PaymentId,
+        _tab_id: &'a str,
+    ) -> BoxFuture<'a, Result<(), PortError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn capture_masked_result<'a>(
+        &'a self,
+        _payment_id: PaymentId,
+        _tab_id: &'a str,
+        _fields: &'a [FieldSpec],
+    ) -> BoxFuture<'a, Result<Vec<u8>, PortError>> {
+        // One PNG signature; this crate's tests never inspect the pixels.
+        Box::pin(async { Ok(vec![0x89, b'P', b'N', b'G']) })
+    }
+
+    fn contain_tab<'a>(
+        &'a self,
+        _payment_id: PaymentId,
+        _tab_id: &'a str,
+    ) -> BoxFuture<'a, Result<(), PortError>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 impl DiscordPort for Driver {
@@ -140,6 +166,8 @@ struct Harness {
     engine: PaymentEngine,
     driver: Arc<Driver>,
     cipher: Arc<CardCipher>,
+    artifacts: Arc<ScreenshotStore>,
+    artifacts_dir: PathBuf,
     path: PathBuf,
 }
 
@@ -149,11 +177,14 @@ impl Harness {
         let store = Arc::new(SqliteStore::open(&path)?);
         let driver = Arc::new(Driver::default());
         let cipher = Arc::new(CardCipher::generate());
+        let artifacts_dir = temp_artifacts_dir(tag);
+        let artifacts = Arc::new(ScreenshotStore::open(&artifacts_dir)?);
         let engine = PaymentEngine::new(
             Arc::clone(&store),
             Arc::clone(&driver) as Arc<dyn CamofoxPort>,
             Arc::clone(&driver) as Arc<dyn DiscordPort>,
             Arc::clone(&cipher),
+            Arc::clone(&artifacts),
             EngineConfig::default(),
         );
         Ok(Self {
@@ -161,6 +192,8 @@ impl Harness {
             engine,
             driver,
             cipher,
+            artifacts,
+            artifacts_dir,
             path,
         })
     }
@@ -172,6 +205,7 @@ impl Harness {
             Arc::clone(&self.driver) as Arc<dyn CamofoxPort>,
             Arc::clone(&self.driver) as Arc<dyn DiscordPort>,
             Arc::clone(&self.cipher),
+            Arc::clone(&self.artifacts),
             EngineConfig::default(),
         )
     }
@@ -187,7 +221,17 @@ impl Harness {
 impl Drop for Harness {
     fn drop(&mut self) {
         remove_db(&self.path);
+        let _ = std::fs::remove_dir_all(&self.artifacts_dir);
     }
+}
+
+fn temp_artifacts_dir(tag: &str) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "broker-card-vault-artifacts-{tag}-{}-{seq}",
+        std::process::id()
+    ))
 }
 
 fn temp_db_path(tag: &str) -> PathBuf {
