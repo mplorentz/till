@@ -31,6 +31,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time::{Instant, sleep_until, timeout_at};
 
+use crate::artifacts::{ArtifactKind, ScreenshotStore};
 use crate::crypto::CardCipher;
 use crate::payment::{CardId, NewPayment, Outcome, PaymentId, PaymentView, TerminalReason};
 use crate::ports::{ApprovalRequest, CamofoxPort, DiscordPort, FillRequest, ResultReviewRequest};
@@ -129,19 +130,21 @@ struct Inner {
     camofox: Arc<dyn CamofoxPort>,
     discord: Arc<dyn DiscordPort>,
     cipher: Arc<CardCipher>,
+    artifacts: Arc<ScreenshotStore>,
     config: EngineConfig,
     waiters: WaitRegistry,
 }
 
 impl PaymentEngine {
-    /// Assemble an engine around a store, the two port implementations and the
-    /// deployment's card cipher.
+    /// Assemble an engine around a store, the two port implementations, the
+    /// deployment's card cipher and its artifact directory.
     #[must_use]
     pub fn new(
         store: Arc<SqliteStore>,
         camofox: Arc<dyn CamofoxPort>,
         discord: Arc<dyn DiscordPort>,
         cipher: Arc<CardCipher>,
+        artifacts: Arc<ScreenshotStore>,
         config: EngineConfig,
     ) -> Self {
         Self {
@@ -150,6 +153,7 @@ impl PaymentEngine {
                 camofox,
                 discord,
                 cipher,
+                artifacts,
                 config,
                 waiters: WaitRegistry::new(),
             }),
@@ -166,6 +170,12 @@ impl PaymentEngine {
     #[must_use]
     pub fn config(&self) -> EngineConfig {
         self.inner.config
+    }
+
+    /// The artifact store masked screenshots are written to (ADR 0008).
+    #[must_use]
+    pub fn artifacts(&self) -> &Arc<ScreenshotStore> {
+        &self.inner.artifacts
     }
 
     /// The long-poll registry, so the HTTP layer can subscribe.
@@ -392,6 +402,10 @@ impl PaymentEngine {
         ) {
             Ok(stored) => {
                 self.inner.waiters.publish(payment_id, stored.state);
+                // spec §7: after a terminal outcome the tab is released to the
+                // agent only as `about:blank`, so card values cannot be read
+                // back out of the page.
+                self.spawn_containment(payment_id, &stored.tab_id);
                 Ok(DecisionResult::Applied)
             }
             Err(StoreError::Conflict { .. } | StoreError::Illegal(_)) => {
@@ -546,6 +560,18 @@ impl PaymentEngine {
                         PaymentEvent::CrashRecovered,
                         TerminalReason::CrashRecovery,
                     );
+                    // The tab may still hold card values after a crash: contain
+                    // it best-effort (spec §7). A tab that is already gone is
+                    // fine — the payment is terminal either way.
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        let camofox = Arc::clone(&self.inner.camofox);
+                        let tab_id = stored.tab_id.clone();
+                        handle.spawn(async move {
+                            if camofox.contain_tab(payment_id, &tab_id).await.is_err() {
+                                eprintln!("broker: containment for {payment_id} failed");
+                            }
+                        });
+                    }
                 }
                 // Terminal states are not in flight; nothing to do.
                 _ => {}
@@ -661,6 +687,9 @@ impl PaymentEngine {
                 PaymentEvent::FillFailed,
                 TerminalReason::PreSubmitError,
             );
+            // A partially typed form still holds card values: contain the tab
+            // before the agent gets it back (spec §7 structural property).
+            self.spawn_containment(payment_id, &stored.tab_id);
             return;
         }
 
@@ -692,6 +721,9 @@ impl PaymentEngine {
                 PaymentEvent::ClickUnconfirmed,
                 TerminalReason::UnconfirmedSubmit,
             );
+            // A tab that still holds card values must not be handed back to the
+            // agent, whatever the outcome (spec §7).
+            self.spawn_containment(payment_id, &stored.tab_id);
             return;
         }
 
@@ -702,6 +734,41 @@ impl PaymentEngine {
             TransitionEffect::default(),
         ) {
             return;
+        }
+
+        // US-10, spec §7: the click is proven once, so from here on nothing can
+        // make the payment `ambiguous`. Let the page settle, then clear/mask the
+        // payment fields before anything is captured (AGENTS.md rule 4) and
+        // leave the masked artifact where the gateway can read it (ADR 0008).
+        // Every failure below is best-effort and logged without a payload.
+        if self
+            .inner
+            .camofox
+            .wait_for_settle(payment_id, &stored.tab_id)
+            .await
+            .is_err()
+        {
+            eprintln!("broker: page settle for {payment_id} failed");
+        }
+
+        match self
+            .inner
+            .camofox
+            .capture_masked_result(payment_id, &stored.tab_id, &stored.fields)
+            .await
+        {
+            Ok(png) => {
+                if let Err(error) =
+                    self.inner
+                        .artifacts
+                        .store(payment_id, ArtifactKind::Result, &png)
+                {
+                    eprintln!("broker: result artifact for {payment_id} failed: {error}");
+                }
+            }
+            // The payment stays `awaiting_result_review`: a capture failure
+            // cannot un-prove a click that already landed.
+            Err(_) => eprintln!("broker: result capture for {payment_id} failed"),
         }
 
         // US-10: hand the human a result screenshot to classify.
@@ -716,6 +783,19 @@ impl PaymentEngine {
         {
             eprintln!("broker: result review for {payment_id} failed: {error}");
         }
+    }
+
+    /// Best-effort `about:blank` containment after a terminal shape we can still
+    /// reach (spec §7). Fire-and-forget, like the hold timer: a dead tab must
+    /// never fail a settled payment.
+    fn spawn_containment(&self, payment_id: PaymentId, tab_id: &str) {
+        let camofox = Arc::clone(&self.inner.camofox);
+        let tab_id = tab_id.to_string();
+        tokio::spawn(async move {
+            if camofox.contain_tab(payment_id, &tab_id).await.is_err() {
+                eprintln!("broker: containment for {payment_id} failed");
+            }
+        });
     }
 
     /// Apply one transition and publish it; `false` if another actor got there

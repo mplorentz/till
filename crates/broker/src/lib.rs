@@ -7,6 +7,8 @@
 //! # Layout
 //!
 //! * [`state`] — the state machine itself (spec §4), a pure transition table.
+//! * [`artifacts`] — the masked-screenshot store the gateway reads by payment
+//!   id (ADR 0008).
 //! * [`payment`] — the DTOs the agent may send and read back (no card data).
 //! * [`store`] — SQLite persistence, idempotency index, submit-once latch,
 //!   the long-term card vault (ADR 0001/0002).
@@ -27,6 +29,7 @@
 //! registration CLI or by [`crypto::CardCipher::decrypt`] inside the engine's
 //! approved fill path, and dropped as soon as the Camofox fill call returns.
 
+pub mod artifacts;
 pub mod auth;
 pub mod crypto;
 pub mod engine;
@@ -37,6 +40,7 @@ pub mod state;
 pub mod store;
 pub mod wait;
 
+pub use artifacts::{ARTIFACTS_DIR_ENV_VAR, ArtifactKind, DEFAULT_ARTIFACTS_DIR, ScreenshotStore};
 pub use auth::{ApiKeys, AuthConfigError, AuthenticatedAgent};
 pub use crypto::{CardCipher, CardFields, CardRecord, CryptoError};
 pub use engine::{CreateOutcome, DecisionResult, EngineConfig, EngineError, PaymentEngine};

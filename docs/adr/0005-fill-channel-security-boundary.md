@@ -84,9 +84,17 @@ redaction is defense-in-depth.
    Residual exposure: one transient plugin event, inside a window where
    the agent already has direct DOM access.
 2. **Mandatory mitigations** (enforced by the fill engine, bead till-ipx
-   — binding regardless of which fill primitive is chosen):
+   — binding regardless of which fill primitive is chosen, and realised as
+   `crates/camofox-client`; the port shape and the masked-screenshot handoff
+   are recorded in ADR 0008):
    - exactly **one** fill operation per payment (one `evaluate` call, or
      one `/type` batch) — exactly one bus event;
+     *(amended 2026-11-22, ADR 0008 Decision 5: the measured `/type` API
+     takes a single field — `{userId, selector, text}` — so there is no
+     batch form. "One fill operation" therefore means one supervised pass:
+     one `/type` per field, strict order, never retried. On camofox ≥ 1.16
+     every `tab:type` event is length-only, so N length-only events are
+     still bus-clean.)*
    - nothing sensitive reaches any result/return channel;
    - Playwright **tracing off** for payment tabs (spike finding A);
    - `about:blank` containment via `evaluate` after terminal outcome
